@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+sqlalchemy
+psycopg[binary]
+redis
+pydantic-settings
+python-multipart
+requests
+tldextract
+pytest
+pytest-asyncio
+httpx
