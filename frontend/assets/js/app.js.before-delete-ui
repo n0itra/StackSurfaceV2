@@ -419,41 +419,6 @@ async function stopScan(id){
   }
 }
 
-async function deleteScan(id){
-  if(
-    !confirm(
-      'Delete this scan permanently? All assets, findings, endpoints, FFUF runs, and scan data will be removed.'
-    )
-  ){
-    return
-  }
-
-  try{
-    await api(
-      `/api/scans/${id}`,
-      {
-        method:'DELETE'
-      }
-    );
-
-    stopScanStream();
-    stopFfufStream();
-
-    state.scanId=null;
-    state.scan=null;
-    state.ffufRunId=null;
-    state.ffufHost=null;
-    state.ffufTargetUrl=null;
-
-    saveNavigationState();
-
-    toast('Scan deleted.');
-    openPage('scans');
-
-  }catch(e){
-    toast(e.message);
-  }
-}
 function openScan(id){
   state.scanId=id;
   saveNavigationState();
@@ -1496,19 +1461,6 @@ async function loadDashboard(){
                           Open
                         </button>
 
-                        ${
-                          terminalStatuses.has(s.status)
-                            ? `
-                              <button
-                                class="btn danger"
-                                onclick="deleteScan('${s.id}')"
-                              >
-                                Delete
-                              </button>
-                            `
-                            : ''
-                        }
-
                       </td>
 
                     </tr>
@@ -1835,19 +1787,6 @@ async function loadScans(){
                           Open
                         </button>
 
-                        ${
-                          terminalStatuses.has(s.status)
-                            ? `
-                              <button
-                                class="btn danger"
-                                onclick="deleteScan('${s.id}')"
-                              >
-                                Delete
-                              </button>
-                            `
-                            : ''
-                        }
-
                       </td>
 
                     </tr>
@@ -1896,15 +1835,18 @@ async function loadScans(){
    ========================================================= */
 
 function assetTabs(){
-    return [
-      'subdomains',
-      'alive',
-      'ports',
-      'endpoints',
-      'secrets',
-      'findings'
-    ]
-  }
+  return [
+    'subdomains',
+    'alive',
+    'ports',
+    'endpoints',
+    'directories',
+    'technologies',
+    'waf',
+    'secrets',
+    'findings'
+  ]
+}
 
 async function getScanResource(
   id,
@@ -2166,19 +2108,6 @@ async function loadScanDetail(){
               `
               : ''
           }
-
-          ${
-  !active
-    ? `
-      <button
-        class="btn danger"
-        onclick="deleteScan('${d.id}')"
-      >
-        Delete Scan
-      </button>
-    `
-    : ''
-}
 
           <button
             class="btn"
@@ -4922,10 +4851,6 @@ setInterval(
   syncHeader,
   5000
 );
-
-
-
-
 
 
 

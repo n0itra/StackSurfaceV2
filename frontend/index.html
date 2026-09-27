@@ -1,4 +1,4 @@
-<!doctype html>
+﻿<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -17,12 +17,21 @@
       <button data-page="assets"><span class="dot"></span>Assets</button>
       <button data-page="changes"><span class="dot"></span>Changes</button>
       <button data-page="findings"><span class="dot"></span>Findings</button>
+<div class="nav-section">
+  <button type="button" class="nav-section-title" id="advancedToolsToggle">
+    <span class="nav-section-label">Advanced Tools</span>
+    <span class="nav-section-chevron">⌄</span>
+  </button>
+  <div class="nav-section-items" id="advancedToolsItems">
+    <button data-page="scan-ffuf"><span class="dot"></span>FFUF</button>
+  </div>
+</div>
     </nav>
-    <div class="side-bottom"><div class="status-card"><div class="status-row"><strong>Local Engine</strong><span id="healthPill" class="pill">CHECKING</span></div><div class="tiny" id="healthText" style="margin-top:8px">API · PostgreSQL · Redis</div><div class="progress" style="margin-top:9px"><span id="engineBar" style="width:20%"></span></div></div></div>
+    <div class="side-bottom"><div class="status-card"><div class="status-row"><strong>Local Engine</strong><span id="healthPill" class="pill">CHECKING</span></div><div class="tiny" id="healthText" style="margin-top:8px">API Â· PostgreSQL Â· Redis</div><div class="progress" style="margin-top:9px"><span id="engineBar" style="width:20%"></span></div></div></div>
   </aside>
 
   <section class="main">
-    <header class="topbar"><div class="search">⌕ <input id="globalSearch" placeholder="Search targets, subdomains, findings..." /></div><div class="actions"><button id="newScanBtn" class="btn primary" onclick="openModal()">＋ New Scan</button></div></header>
+    <header class="topbar"><div class="search">âŒ• <input id="globalSearch" placeholder="Search targets, subdomains, findings..." /></div><div class="actions"><button id="newScanBtn" class="btn primary" onclick="openModal()">ï¼‹ New Scan</button></div></header>
     <main class="content">
       <section class="page active" id="page-dashboard"></section>
       <section class="page" id="page-scans"></section>
@@ -35,14 +44,14 @@
   </section>
 </div>
 
-<div class="modal-backdrop" id="scanModal"><div class="modal"><div class="modal-head"><strong>New Scan</strong><button class="x" onclick="closeModal()">×</button></div><div class="modal-body">
+<div class="modal-backdrop" id="scanModal"><div class="modal"><div class="modal-head"><strong>New Scan</strong><button class="x" onclick="closeModal()">Ã—</button></div><div class="modal-body">
   <div id="scanBlock" class="callout">One active scan is allowed. The <strong>Stop Scan</strong> button appears on the active scan.</div>
   <div class="form-grid" style="margin-top:15px"><div class="field full"><label>Target links</label><textarea class="textarea" id="targetLinks" placeholder="example.com&#10;https://example.com&#10;https://www.example.com/login"></textarea></div></div>
   <div style="margin-top:16px"><div style="font-size:11px;color:#7890a6;margin-bottom:8px">SCAN TYPE</div><div class="compact-scan-types" id="scanProfiles">
-    <button type="button" class="compact-scan-type selected" data-profile="full" onclick="selectProfile('full')"><span class="scan-radio"></span><span class="scan-type-name">Full Recon</span><span class="scan-type-hint">Complete surface + analysis</span><span class="info-wrap"><span class="info-icon">!</span><span class="info-tooltip"><strong>Full Recon</strong><span>Subfinder · Findomain · Assetfinder · CRT.sh · AlterX · DNSx · HTTPx (200/401/403/404) · CDN Check · Shodan non-CDN IPs · GAU · Katana · Tech/WAF · Nuclei update + scan · Jsluice · TruffleHog · changes</span></span></span></button>
-    <button type="button" class="compact-scan-type" data-profile="discovery" onclick="selectProfile('discovery')"><span class="scan-radio"></span><span class="scan-type-name">Discovery</span><span class="scan-type-hint">Find and validate assets</span><span class="info-wrap"><span class="info-icon">!</span><span class="info-tooltip"><strong>Discovery</strong><span>Subfinder · Findomain · Assetfinder · CRT.sh · AlterX · DNSx · HTTPx (200/401/403/404) · changes</span></span></span></button>
-    <button type="button" class="compact-scan-type" data-profile="web" onclick="selectProfile('web')"><span class="scan-radio"></span><span class="scan-type-name">Web Surface</span><span class="scan-type-hint">Endpoints, crawling, tech & WAF</span><span class="info-wrap"><span class="info-icon">!</span><span class="info-tooltip"><strong>Web Surface</strong><span>Existing web assets · GAU · Katana · endpoint dedup · technologies · WAF · JS analysis · changes</span></span></span></button>
-    <button type="button" class="compact-scan-type" data-profile="vuln" onclick="selectProfile('vuln')"><span class="scan-radio"></span><span class="scan-type-name">Vulnerability Focus</span><span class="scan-type-hint">CVEs, bugs & secrets</span><span class="info-wrap"><span class="info-icon">!</span><span class="info-tooltip"><strong>Vulnerability Focus</strong><span>Existing web assets · Nuclei template update · Nuclei · Jsluice · TruffleHog · changes</span></span></span></button>
+    <button type="button" class="compact-scan-type selected" data-profile="full" onclick="selectProfile('full')"><span class="scan-radio"></span><span class="scan-type-name">Full Recon</span><span class="scan-type-hint">Complete surface + analysis</span><span class="info-wrap"><span class="info-icon">!</span><span class="info-tooltip"><strong>Full Recon</strong><span>Subfinder Â· Findomain Â· Assetfinder Â· CRT.sh Â· AlterX Â· DNSx Â· HTTPx (200/401/403/404) Â· CDN Check Â· Shodan non-CDN IPs Â· GAU Â· Katana Â· Tech/WAF Â· Nuclei update + scan Â· Jsluice Â· TruffleHog Â· changes</span></span></span></button>
+    <button type="button" class="compact-scan-type" data-profile="discovery" onclick="selectProfile('discovery')"><span class="scan-radio"></span><span class="scan-type-name">Discovery</span><span class="scan-type-hint">Find and validate assets</span><span class="info-wrap"><span class="info-icon">!</span><span class="info-tooltip"><strong>Discovery</strong><span>Subfinder Â· Findomain Â· Assetfinder Â· CRT.sh Â· AlterX Â· DNSx Â· HTTPx (200/401/403/404) Â· changes</span></span></span></button>
+    <button type="button" class="compact-scan-type" data-profile="web" onclick="selectProfile('web')"><span class="scan-radio"></span><span class="scan-type-name">Web Surface</span><span class="scan-type-hint">Endpoints, crawling, tech & WAF</span><span class="info-wrap"><span class="info-icon">!</span><span class="info-tooltip"><strong>Web Surface</strong><span>Existing web assets Â· GAU Â· Katana Â· endpoint dedup Â· technologies Â· WAF Â· JS analysis Â· changes</span></span></span></button>
+    <button type="button" class="compact-scan-type" data-profile="vuln" onclick="selectProfile('vuln')"><span class="scan-radio"></span><span class="scan-type-name">Vulnerability Focus</span><span class="scan-type-hint">CVEs, bugs & secrets</span><span class="info-wrap"><span class="info-icon">!</span><span class="info-tooltip"><strong>Vulnerability Focus</strong><span>Existing web assets Â· Nuclei template update Â· Nuclei Â· Jsluice Â· TruffleHog Â· changes</span></span></span></button>
   </div></div>
   <div class="callout" id="profileSummary" style="margin-top:14px"><strong>Full Recon</strong> runs the complete pipeline.</div>
 </div><div class="modal-foot"><button class="btn" onclick="closeModal()">Cancel</button><button id="startScanBtn" class="btn primary" onclick="createScan()">Start Scan</button></div></div></div>
@@ -51,3 +60,6 @@
 <script src="/assets/js/app.js"></script>
 </body>
 </html>
+
+
+

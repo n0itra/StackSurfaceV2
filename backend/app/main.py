@@ -130,8 +130,7 @@ def dashboard():
             or 0
         )
 
-        recent_changes = db.scalars(
-            select(Change, Scan, Target)
+        recent_changes = db.execute(select(Change, Scan, Target)
             .join(Scan, Change.scan_id == Scan.id)
             .join(Target, Scan.target_id == Target.id)
             .order_by(Change.id.desc())
@@ -389,6 +388,36 @@ def cancel_scan(scan_id: str):
     return stop_scan(scan_id)
 
 
+
+@app.delete("/api/scans/{scan_id}")
+def delete_scan(scan_id: str):
+    with SessionLocal() as db:
+        scan = db.get(Scan, scan_id)
+
+        if not scan:
+            raise HTTPException(
+                404,
+                "Scan not found",
+            )
+
+        if scan.status in {
+            "queued",
+            "running",
+            "stopping",
+        }:
+            raise HTTPException(
+                409,
+                "Cannot delete an active scan. Stop it first and wait until it finishes.",
+            )
+
+        db.delete(scan)
+        db.commit()
+
+    return {
+        "ok": True,
+        "scan_id": scan_id,
+        "status": "deleted",
+    }
 # ---------------------------------------------------------------------------
 # Scan event stream
 # ---------------------------------------------------------------------------
@@ -1131,6 +1160,49 @@ def create_ffuf_run(
         )
 
 
+@app.post(
+    "/api/ffuf-runs/{run_id}/stop",
+    response_model=FFUFOut,
+)
+def stop_ffuf_run(
+    run_id: str,
+):
+    with SessionLocal() as db:
+        run = db.get(
+            FFUFRuns,
+            run_id,
+        )
+
+        if not run:
+            raise HTTPException(
+                404,
+                "FFUF run not found",
+            )
+
+        if run.status in {
+            "completed",
+            "failed",
+            "cancelled",
+        }:
+            return FFUFOut.model_validate(run)
+
+        if run.status == "stopping":
+            return FFUFOut.model_validate(run)
+
+        if run.status == "queued":
+            run.status = "cancelled"
+            run.error = "FFUF stopped by user before execution"
+            run.finished_at = datetime.now(timezone.utc)
+        else:
+            run.status = "stopping"
+            run.error = "FFUF stop requested by user"
+
+        db.commit()
+        db.refresh(run)
+
+        return FFUFOut.model_validate(run)
+
+
 @app.get(
     "/api/ffuf-runs/{run_id}",
     response_model=FFUFOut,
@@ -1196,6 +1268,7 @@ async def ffuf_stream(
                 if run.status in {
                     "completed",
                     "failed",
+                    "cancelled",
                 }:
                     yield (
                         "event: done\n"
@@ -1261,4 +1334,8 @@ async def scan_ws(
 
     except WebSocketDisconnect:
         return
+
+
+
+
 

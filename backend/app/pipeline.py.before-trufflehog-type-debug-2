@@ -999,14 +999,6 @@ async def stage_js_analysis(db: Session, scan: Scan):
             for obj in parse_json_lines(
                 res.stdout
             ):
-                print(
-    "TRUFFLEHOG RAW TYPES:",
-    {
-        k: type(v).__name__
-        for k, v in obj.items()
-    }
-)
-
                 reason = (
                     obj.get("DetectorName")
                     or obj.get("detector_name")
@@ -1727,7 +1719,6 @@ async def run_ffuf(run_id: str):
         except Exception:
             pass
         db.close()
-
 
 
 
