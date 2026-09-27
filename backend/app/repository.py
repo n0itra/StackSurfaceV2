@@ -26,10 +26,22 @@ def attach_target_link(db: Session, target: Target, raw: str, normalized: str) -
 
 
 def previous_completed_scan(db: Session, scan: Scan) -> Scan | None:
+    terminal_statuses = [
+        "completed",
+        "completed_with_warnings",
+    ]
+
     return db.scalar(
         select(Scan)
-        .where(Scan.target_id == scan.target_id, Scan.id != scan.id, Scan.status.in_(["completed", "completed_with_warnings"]))
-        .order_by(Scan.created_at.desc())
+        .where(
+            Scan.target_id == scan.target_id,
+            Scan.id != scan.id,
+            Scan.status.in_(terminal_statuses),
+        )
+        .order_by(
+            Scan.finished_at.desc().nullslast(),
+            Scan.created_at.desc(),
+        )
         .limit(1)
     )
 

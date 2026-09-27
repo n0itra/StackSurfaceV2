@@ -4412,179 +4412,27 @@ document
       )
   );
 
-async function performGlobalSearch(query){
-  const q = String(query || '').trim();
-
-  if(!q){
-    return;
-  }
-
-  const input = $('globalSearch');
-
-  try{
-    if(input){
-      input.disabled = true;
-    }
-
-    const results = await api(
-      `/api/search?q=${encodeURIComponent(q)}&limit=100`
-    );
-
-    if(!results || !Array.isArray(results.results)){
-      throw new Error('Invalid search response');
-    }
-
-    const rows = results.results;
-
-    if(!rows.length){
-      openPage('scans');
-
-      const page = $('page-scans');
-
-      if(page){
-        page.innerHTML = `
-          <div class="empty">
-            No results found for
-            <strong>${escapeHtml(q)}</strong>
-          </div>
-        `;
-      }
-
-      return;
-    }
-
-    openPage('scans');
-
-    const page = $('page-scans');
-
-    if(!page){
-      return;
-    }
-
-    page.innerHTML = `
-      <div class="card">
-        <div class="card-head">
-          <div>
-            <h2>Global Search</h2>
-            <div class="muted">
-              ${rows.length} result${rows.length === 1 ? '' : 's'}
-              for "${escapeHtml(q)}"
-            </div>
-          </div>
-        </div>
-
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>TYPE</th>
-                <th>NAME</th>
-                <th>DETAIL</th>
-                <th>SCAN</th>
-              </tr>
-            </thead>
-
-            <tbody>
-              ${rows.map((row, index)=>`
-                <tr
-                  role="button"
-                  tabindex="0"
-                  class="global-search-result"
-                  data-search-index="${index}"
-                  style="cursor:pointer"
-                >
-                  <td>
-                    ${escapeHtml(row.type || '')}
-                  </td>
-
-                  <td>
-                    ${escapeHtml(row.name || row.value || '')}
-                  </td>
-
-                  <td>
-                    ${escapeHtml(
-                      row.detail ||
-                      row.url ||
-                      row.fqdn ||
-                      row.ip ||
-                      ''
-                    )}
-                  </td>
-
-                  <td>
-                    ${escapeHtml(
-                      row.scan_name ||
-                      row.scan_id ||
-                      ''
-                    )}
-                  </td>
-                </tr>
-              `).join('')}
-            </tbody>
-          </table>
-        </div>
-      </div>
-    `;
-
-    document
-      .querySelectorAll('.global-search-result')
-      .forEach(el=>{
-        const index = Number(el.dataset.searchIndex);
-        const row = rows[index];
-
-        const activate = ()=>{
-          if(row && row.scan_id){
-            state.scanId = row.scan_id;
-            state.page = 'scan-detail';
-            saveNavigationState();
-            openPage('scan-detail');
-          }
-        };
-
-        el.addEventListener('click', activate);
-
-        el.addEventListener('keydown', e=>{
-          if(
-            e.key === 'Enter' ||
-            e.key === ' '
-          ){
-            e.preventDefault();
-            activate();
-          }
-        });
-      });
-
-  }catch(err){
-    console.error('Global search failed:', err);
-
-    openPage('scans');
-
-    const page = $('page-scans');
-
-    if(page){
-      page.innerHTML = `
-        <div class="empty">
-          Global search failed:
-          ${escapeHtml(err.message || String(err))}
-        </div>
-      `;
-    }
-
-  }finally{
-    if(input){
-      input.disabled = false;
-    }
-  }
-}
-
 $('globalSearch').addEventListener(
   'keydown',
   e=>{
-    if(e.key === 'Enter'){
-      performGlobalSearch(e.target.value);
+    if(e.key==='Enter'){
+
+      const q=
+        e.target.value
+          .trim()
+          .toLowerCase();
+
+      if(!q){
+        return
+      }
+
+      loadScans().then(
+        ()=>openPage('scans')
+      );
     }
   }
 );
+
 profileSelect('full');
 
 refreshHealth();

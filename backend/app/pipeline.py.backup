@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import asyncio
 import json
@@ -18,10 +18,9 @@ from sqlalchemy.orm import Session
 from .config import settings
 from .db import SessionLocal
 from .models import (Scan, ScanStage, ToolRun, Subdomain, WebService, OpenPort, Endpoint,
-                     Directory, Secret, Finding, Change, FFUFRuns, FFUFEvent, Wordlist,
-                     InfrastructureIP)
+                     Directory, Secret, Finding, Change, FFUFRuns, FFUFEvent, InfrastructureIP)
+from .repository import previous_completed_scan, scan_counts
 from .utils import clean_host_lines, in_scope, mask_secret
-from .repository import previous_completed_scan
 
 
 FULL_STAGES = [
@@ -498,108 +497,23 @@ async def stage_gau_katana(db: Session, scan: Scan):
     db.commit()
 
 
-ANSI_ESCAPE_RE = re.compile(
-    r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])"
-)
-
-
-def clean_tool_output(text: str) -> str:
-    return ANSI_ESCAPE_RE.sub("", text or "")
-
-
-def parse_wafw00f_output(text: str) -> str | None:
-    clean = clean_tool_output(text)
-
-    for raw_line in clean.splitlines():
-        line = raw_line.strip()
-
-        if not line:
-            continue
-
-        lower = line.lower()
-
-        # Ignore wafw00f banner/version lines.
-        if "wafw00f" in lower:
-            continue
-
-        # Positive detection.
-        if "is behind" in lower:
-            match = re.search(
-                r"is behind\s+(.+?)\s+WAF",
-                line,
-                re.IGNORECASE,
-            )
-
-            if match:
-                return match.group(1).strip(" :.-")
-
-            match = re.search(
-                r"is behind\s+(.+)$",
-                line,
-                re.IGNORECASE,
-            )
-
-            if match:
-                value = match.group(1).strip(" :.-")
-
-                value = re.sub(
-                    r"\s+WAF.*$",
-                    "",
-                    value,
-                    flags=re.IGNORECASE,
-                )
-
-                return value.strip(" :.-")
-
-        # Negative detection.
-        if (
-            "no waf detected" in lower
-            or "does not seem to be behind a waf" in lower
-            or "not behind a waf" in lower
-        ):
-            return "No WAF detected"
-
-    return None
-
-
 async def stage_tech_waf(db: Session, scan: Scan):
-    services = db.scalars(
-        select(WebService).where(
-            WebService.scan_id == scan.id
-        )
-    ).all()
-
+    services = db.scalars(select(WebService).where(WebService.scan_id == scan.id)).all()
     sem = asyncio.Semaphore(4)
 
     async def detect(ws: WebService):
         async with sem:
             if not ws.url:
-                return ws, None
-
-            res = await run_command(
-                db,
-                scan.id,
-                "wafw00f",
-                "technologies_waf",
-                [ws.url],
-            )
-
-            waf_name = parse_wafw00f_output(
-                res.stdout
-            )
-
-            return ws, waf_name
-
-    results = await asyncio.gather(
-        *(detect(ws) for ws in services)
-    )
-
-    # Perform DB updates sequentially after
-    # all concurrent tool executions finish.
-    for ws, waf_name in results:
-        ws.waf_name = waf_name
-
+                return
+            res = await run_command(db, scan.id, "wafw00f", "technologies_waf", [ws.url])
+            lines = [l.strip() for l in res.stdout.splitlines() if l.strip()]
+            for line in lines:
+                if "is behind" in line.lower() or "waf" in line.lower():
+                    ws.waf_name = line[-120:]
+                    break
+    await asyncio.gather(*(detect(ws) for ws in services))
     db.commit()
+
 
 async def stage_nuclei_update(db: Session, scan: Scan):
     if not settings.nuclei_auto_update:
@@ -611,9 +525,7 @@ async def stage_nuclei(db: Session, scan: Scan):
     urls = sorted({
         w.url
         for w in db.scalars(
-            select(WebService).where(
-                WebService.scan_id == scan.id
-            )
+            select(WebService).where(WebService.scan_id == scan.id)
         ).all()
         if w.url
     })
@@ -621,9 +533,7 @@ async def stage_nuclei(db: Session, scan: Scan):
     urls += sorted({
         e.url
         for e in db.scalars(
-            select(Endpoint).where(
-                Endpoint.scan_id == scan.id
-            )
+            select(Endpoint).where(Endpoint.scan_id == scan.id)
         ).all()
         if e.url
     })
@@ -633,13 +543,8 @@ async def stage_nuclei(db: Session, scan: Scan):
     if not urls:
         return
 
-    with tempfile.NamedTemporaryFile(
-        "w",
-        delete=False
-    ) as tmp:
-        tmp.write(
-            "\n".join(urls) + "\n"
-        )
+    with tempfile.NamedTemporaryFile("w", delete=False) as tmp:
+        tmp.write("\n".join(urls) + "\n")
         path = tmp.name
 
     try:
@@ -650,18 +555,9 @@ async def stage_nuclei(db: Session, scan: Scan):
             "nuclei",
             [
                 "-l", path,
-
-                # New templates from the latest
-                # nuclei-templates release only.
-                "-nt",
-
-                # CVE templates only.
-                "-tags", "cve",
-
                 "-jsonl",
                 "-silent",
-                "-severity",
-                "info,low,medium,high,critical",
+                "-severity", "info,low,medium,high,critical",
                 "-restrict-local-network-access",
             ],
         )
@@ -687,23 +583,16 @@ async def stage_nuclei(db: Session, scan: Scan):
         )
 
         severity = info.get("severity")
-        target = (
-            obj.get("matched-at")
-            or obj.get("host")
-            or obj.get("url")
-        )
+        target = obj.get("matched-at") or obj.get("host") or obj.get("url")
 
         if not target:
             continue
 
         target = str(target).strip()
+        key = f"nuclei|{name}|{target}"
 
-        key = (
-            f"nuclei|{name}|{target}"
-        )
-
-        # Prevent duplicates already stored in the DB
-        # and duplicates within the same Nuclei batch.
+        # Prevent duplicates already stored in the DB and duplicates within
+        # the same Nuclei output batch before PostgreSQL sees the INSERTs.
         if key in seen_keys:
             continue
 
@@ -714,11 +603,7 @@ async def stage_nuclei(db: Session, scan: Scan):
                 scan_id=scan.id,
                 name=str(name)[:255],
                 tool="nuclei",
-                severity=(
-                    str(severity)
-                    if severity
-                    else None
-                ),
+                severity=str(severity) if severity else None,
                 target=target,
                 dedupe_key=key,
                 status="open",
@@ -728,40 +613,17 @@ async def stage_nuclei(db: Session, scan: Scan):
 
     db.commit()
 
+
 async def download_js(url: str) -> bytes:
     response = await asyncio.to_thread(requests.get, url, timeout=30, headers={"User-Agent": "StackSurface/1.0"})
     response.raise_for_status()
     return response.content[:5_000_000]
 
+
 async def stage_js_analysis(db: Session, scan: Scan):
-    js_urls = [
-        e.url
-        for e in db.scalars(
-            select(Endpoint).where(
-                Endpoint.scan_id == scan.id
-            )
-        ).all()
-        if e.url
-        and ".js" in urlparse(e.url).path.lower()
-    ]
-
+    js_urls = [e.url for e in db.scalars(select(Endpoint).where(Endpoint.scan_id == scan.id)).all() if ".js" in urlparse(e.url).path.lower()]
     if not js_urls:
-        js_urls = [
-            w.url
-            for w in db.scalars(
-                select(WebService).where(
-                    WebService.scan_id == scan.id
-                )
-            ).all()
-            if w.url
-            and ".js" in urlparse(w.url).path.lower()
-        ]
-
-    js_urls = sorted(set(js_urls))
-
-    if not js_urls:
-        return
-
+        js_urls = [w.url for w in db.scalars(select(WebService).where(WebService.scan_id == scan.id)).all() if ".js" in urlparse(w.url).path.lower()]
     sem = asyncio.Semaphore(4)
 
     async def analyze(url: str):
@@ -769,640 +631,79 @@ async def stage_js_analysis(db: Session, scan: Scan):
             try:
                 content = await download_js(url)
             except Exception:
-                return [], []
-
-            with tempfile.NamedTemporaryFile(
-                "wb",
-                suffix=".js",
-                delete=False
-            ) as tmp:
+                return
+            with tempfile.NamedTemporaryFile("wb", suffix=".js", delete=False) as tmp:
                 tmp.write(content)
                 path = tmp.name
-
-            endpoint_candidates = []
-            secret_candidates = []
-
             try:
-                urls_res = await run_command(
-                    db,
-                    scan.id,
-                    "jsluice",
-                    "js_analysis",
-                    ["urls", path]
-                )
-
-                secrets_res = await run_command(
-                    db,
-                    scan.id,
-                    "jsluice",
-                    "js_analysis",
-                    ["secrets", path]
-                )
-
-                parsed = urlparse(url)
-
-                base = (
-                    f"{parsed.scheme}://"
-                    f"{parsed.netloc}"
-                )
-
-                for obj in parse_json_lines(
-                    urls_res.stdout
-                ):
+                urls_res = await run_command(db, scan.id, "jsluice", "js_analysis", ["urls", path])
+                secrets_res = await run_command(db, scan.id, "jsluice", "js_analysis", ["secrets", path])
+                for obj in parse_json_lines(urls_res.stdout):
                     endpoint = obj.get("url")
-
-                    if not endpoint:
-                        continue
-
-                    endpoint = str(
-                        endpoint
-                    ).strip()
-
-                    if not endpoint:
-                        continue
-
-                    if (
-                        endpoint.startswith("http://")
-                        or endpoint.startswith("https://")
-                    ):
-                        absolute_url = endpoint
-
-                    elif endpoint.startswith("//"):
-                        absolute_url = (
-                            f"{parsed.scheme}:{endpoint}"
-                        )
-
-                    else:
-                        absolute_url = (
-                            f"{base}/"
-                            f"{endpoint.lstrip('/')}"
-                        )
-
-                    endpoint_candidates.append(
-                        (
-                            absolute_url,
-                            obj
-                        )
-                    )
-
-                for obj in parse_json_lines(
-                    secrets_res.stdout
-                ):
-                    kind = (
-                        obj.get("kind")
-                        or "JavaScript secret"
-                    )
-
-                    data = (
-                        obj.get("data")
-                        or {}
-                    )
-
-                    candidate = json.dumps(
-                        data,
-                        sort_keys=True
-                    )
-
-                    secret_candidates.append(
-                        (
-                            kind,
-                            url,
-                            mask_secret(candidate),
-                            obj
-                        )
-                    )
-
+                    if endpoint:
+                        db.add(Endpoint(scan_id=scan.id, url=endpoint if endpoint.startswith("http") else f"{urlparse(url).scheme}://{urlparse(url).netloc}{endpoint}", source="jsluice", method=obj.get("method"), kind="js" if endpoint.endswith(".js") else "endpoint", raw=obj))
+                for obj in parse_json_lines(secrets_res.stdout):
+                    kind = obj.get("kind") or "JavaScript secret"
+                    data = obj.get("data") or {}
+                    candidate = json.dumps(data, sort_keys=True)
+                    db.add(Secret(scan_id=scan.id, source="jsluice", kind=kind, location=url, value_masked=mask_secret(candidate), severity=obj.get("severity"), raw=obj))
             finally:
                 os.unlink(path)
 
-            return (
-                endpoint_candidates,
-                secret_candidates
-            )
-
-    results = await asyncio.gather(
-        *(
-            analyze(url)
-            for url in js_urls
-        )
-    )
-
-    # Deduplicate endpoints before PostgreSQL INSERT.
-    existing_urls = set(
-        db.scalars(
-            select(Endpoint.url).where(
-                Endpoint.scan_id == scan.id
-            )
-        ).all()
-    )
-
-    seen_urls = set(existing_urls)
-
-    for endpoint_results, _ in results:
-        for endpoint_url, obj in endpoint_results:
-            endpoint_url = endpoint_url.strip()
-
-            if not endpoint_url:
-                continue
-
-            if endpoint_url in seen_urls:
-                continue
-
-            seen_urls.add(endpoint_url)
-
-            endpoint_path = (
-                urlparse(endpoint_url)
-                .path
-                .lower()
-            )
-
-            kind = (
-                "js"
-                if endpoint_path.endswith(".js")
-                else "endpoint"
-            )
-
-            db.add(
-                Endpoint(
-                    scan_id=scan.id,
-                    url=endpoint_url,
-                    source="jsluice",
-                    method=obj.get("method"),
-                    kind=kind,
-                    raw=obj
-                )
-            )
-
-    # Persist Jsluice secrets.
-    for _, secret_results in results:
-        for (
-            kind,
-            location,
-            value_masked,
-            obj
-        ) in secret_results:
-
-            db.add(
-                Secret(
-                    scan_id=scan.id,
-                    source="jsluice",
-                    kind=kind,
-                    location=location,
-                    value_masked=value_masked,
-                    severity=obj.get("severity"),
-                    raw=obj
-                )
-            )
-
+    await asyncio.gather(*(analyze(url) for url in sorted(set(js_urls))))
     db.commit()
 
-    # TruffleHog secondary secret analysis.
+    # TruffleHog is used as a secondary secret check over an ephemeral directory.
     with tempfile.TemporaryDirectory() as temp_dir:
         paths = []
-
-        for url in js_urls[:100]:
+        for url in sorted(set(js_urls))[:100]:
             try:
                 content = await download_js(url)
             except Exception:
                 continue
-
-            filename = re.sub(
-                r"[^A-Za-z0-9_.-]",
-                "_",
-                urlparse(
-                    url
-                ).path
-                or "index.js"
-            )[-120:]
-
-            file_path = (
-                Path(temp_dir) / filename
-            )
-
+            filename = re.sub(r"[^A-Za-z0-9_.-]", "_", urlparse(url).path or "index.js")[-120:]
+            file_path = Path(temp_dir) / filename
             file_path.write_bytes(content)
             paths.append(str(file_path))
-
         if paths:
-            res = await run_command(
-                db,
-                scan.id,
-                "trufflehog",
-                "js_analysis",
-                [
-                    "filesystem",
-                    temp_dir,
-                    "--json",
-                    "--no-verification"
-                ]
-            )
-
-            for obj in parse_json_lines(
-                res.stdout
-            ):
-                reason = (
-                    obj.get("DetectorName")
-                    or obj.get("detector_name")
-                    or "Potential Secret"
-                )
-
-                raw_value = (
-                    obj.get("Raw")
-                    or obj.get("raw")
-                )
-
-                db.add(
-                    Secret(
-                        scan_id=scan.id,
-                        source="trufflehog",
-                        kind=str(reason),
-                        location=(
-                            obj
-                            .get("SourceMetadata", {})
-                            .get("Data", {})
-                            .get("Filesystem")
-                        ),
-                        value_masked=(
-                            mask_secret(
-                                str(raw_value)
-                            )
-                            if raw_value
-                            else None
-                        ),
-                        verified=obj.get(
-                            "Verified"
-                        ),
-                        raw=obj
-                    )
-                )
-
+            res = await run_command(db, scan.id, "trufflehog", "js_analysis", ["filesystem", temp_dir, "--json", "--no-verification"])
+            for obj in parse_json_lines(res.stdout):
+                reason = obj.get("DetectorName") or obj.get("detector_name") or "Potential Secret"
+                raw_value = obj.get("Raw") or obj.get("raw")
+                db.add(Secret(scan_id=scan.id, source="trufflehog", kind=str(reason), location=obj.get("SourceMetadata", {}).get("Data", {}).get("Filesystem"), value_masked=mask_secret(str(raw_value)) if raw_value else None, verified=obj.get("Verified"), raw=obj))
             db.commit()
+
 
 async def stage_changes(db: Session, scan: Scan):
     previous = previous_completed_scan(db, scan)
     if not previous:
         return
+    old_subs = {x.fqdn for x in db.scalars(select(Subdomain).where(Subdomain.scan_id == previous.id)).all()}
+    new_subs = {x.fqdn for x in db.scalars(select(Subdomain).where(Subdomain.scan_id == scan.id)).all()}
+    for fqdn in sorted(new_subs - old_subs):
+        db.add(Change(scan_id=scan.id, change_type="subdomain", asset=fqdn, current_value="new"))
+        row = db.scalar(select(Subdomain).where(Subdomain.scan_id == scan.id, Subdomain.fqdn == fqdn))
+        if row:
+            row.is_new = True
 
-    # Clear existing changes so rerunning the stage is deterministic.
-    db.query(Change).filter(Change.scan_id == scan.id).delete(
-        synchronize_session=False
-    )
-    db.flush()
+    old_urls = {x.url for x in db.scalars(select(Endpoint).where(Endpoint.scan_id == previous.id)).all()}
+    new_urls = {x.url for x in db.scalars(select(Endpoint).where(Endpoint.scan_id == scan.id)).all()}
+    for url in sorted(new_urls - old_urls):
+        db.add(Change(scan_id=scan.id, change_type="endpoint", asset=url, current_value="new"))
 
-    def snapshot(value):
-        if value is None:
-            return None
-        if isinstance(value, (dict, list, tuple, set)):
-            return json.dumps(value, sort_keys=True, default=str)
-        return str(value)
+    old_ports = {(x.ip, x.port, x.protocol) for x in db.scalars(select(OpenPort).where(OpenPort.scan_id == previous.id)).all()}
+    new_ports = {(x.ip, x.port, x.protocol) for x in db.scalars(select(OpenPort).where(OpenPort.scan_id == scan.id)).all()}
+    for ip, port, protocol in sorted(new_ports - old_ports):
+        db.add(Change(scan_id=scan.id, change_type="port", asset=f"{ip}:{port}/{protocol}", current_value="new"))
 
-    def add_change(
-        change_type,
-        asset,
-        previous_value=None,
-        current_value=None,
-    ):
-        db.add(
-            Change(
-                scan_id=scan.id,
-                change_type=change_type,
-                asset=str(asset),
-                previous_value=snapshot(previous_value),
-                current_value=snapshot(current_value),
-            )
-        )
-
-    # ---------------------------------------------------------
-    # SUBDOMAINS
-    # ---------------------------------------------------------
-    old_subs = {
-        x.fqdn: x
-        for x in db.scalars(
-            select(Subdomain).where(Subdomain.scan_id == previous.id)
-        ).all()
-    }
-
-    new_subs = {
-        x.fqdn: x
-        for x in db.scalars(
-            select(Subdomain).where(Subdomain.scan_id == scan.id)
-        ).all()
-    }
-
-    for fqdn in sorted(new_subs.keys() - old_subs.keys()):
-        add_change(
-            "subdomain",
-            fqdn,
-            previous_value=None,
-            current_value="new",
-        )
-        new_subs[fqdn].is_new = True
-
-    for fqdn in sorted(old_subs.keys() - new_subs.keys()):
-        add_change(
-            "subdomain",
-            fqdn,
-            previous_value="present",
-            current_value="removed",
-        )
-
-    # ---------------------------------------------------------
-    # ALIVE WEB SERVICES
-    # ---------------------------------------------------------
-    old_alive = {
-        x.url: x
-        for x in db.scalars(
-            select(WebService).where(WebService.scan_id == previous.id)
-        ).all()
-    }
-
-    new_alive = {
-        x.url: x
-        for x in db.scalars(
-            select(WebService).where(WebService.scan_id == scan.id)
-        ).all()
-    }
-
-    for url in sorted(new_alive.keys() - old_alive.keys()):
-        add_change(
-            "alive",
-            url,
-            previous_value=None,
-            current_value="new",
-        )
-
-    for url in sorted(old_alive.keys() - new_alive.keys()):
-        add_change(
-            "alive",
-            url,
-            previous_value="present",
-            current_value="removed",
-        )
-
-    for url in sorted(old_alive.keys() & new_alive.keys()):
-        old = old_alive[url]
-        new = new_alive[url]
-
-        fields = [
-            "status_code",
-            "title",
-            "ip",
-            "cdn",
-            "cdn_name",
-            "waf_name",
-            "technologies",
-        ]
-
-        for field in fields:
-            old_value = getattr(old, field, None)
-            new_value = getattr(new, field, None)
-
-            if snapshot(old_value) != snapshot(new_value):
-                add_change(
-                    "alive",
-                    url,
-                    previous_value=f"{field}={snapshot(old_value)}",
-                    current_value=f"{field}={snapshot(new_value)}",
-                )
-
-    # ---------------------------------------------------------
-    # ENDPOINTS
-    # ---------------------------------------------------------
-    old_endpoints = {
-        x.url: x
-        for x in db.scalars(
-            select(Endpoint).where(Endpoint.scan_id == previous.id)
-        ).all()
-    }
-
-    new_endpoints = {
-        x.url: x
-        for x in db.scalars(
-            select(Endpoint).where(Endpoint.scan_id == scan.id)
-        ).all()
-    }
-
-    for url in sorted(new_endpoints.keys() - old_endpoints.keys()):
-        add_change(
-            "endpoint",
-            url,
-            previous_value=None,
-            current_value="new",
-        )
-
-    for url in sorted(old_endpoints.keys() - new_endpoints.keys()):
-        add_change(
-            "endpoint",
-            url,
-            previous_value="present",
-            current_value="removed",
-        )
-
-    for url in sorted(old_endpoints.keys() & new_endpoints.keys()):
-        old = old_endpoints[url]
-        new = new_endpoints[url]
-
-        fields = [
-            "status_code",
-            "method",
-            "kind",
-            "source",
-        ]
-
-        for field in fields:
-            old_value = getattr(old, field, None)
-            new_value = getattr(new, field, None)
-
-            if snapshot(old_value) != snapshot(new_value):
-                add_change(
-                    "endpoint",
-                    url,
-                    previous_value=f"{field}={snapshot(old_value)}",
-                    current_value=f"{field}={snapshot(new_value)}",
-                )
-
-    # ---------------------------------------------------------
-    # PORTS
-    # ---------------------------------------------------------
-    def port_key(x):
-        return (x.ip, x.port, x.protocol)
-
-    old_ports = {
-        port_key(x): x
-        for x in db.scalars(
-            select(OpenPort).where(OpenPort.scan_id == previous.id)
-        ).all()
-    }
-
-    new_ports = {
-        port_key(x): x
-        for x in db.scalars(
-            select(OpenPort).where(OpenPort.scan_id == scan.id)
-        ).all()
-    }
-
-    for key in sorted(new_ports.keys() - old_ports.keys()):
-        ip, port, protocol = key
-        add_change(
-            "port",
-            f"{ip}:{port}/{protocol}",
-            previous_value=None,
-            current_value="new",
-        )
-
-    for key in sorted(old_ports.keys() - new_ports.keys()):
-        ip, port, protocol = key
-        add_change(
-            "port",
-            f"{ip}:{port}/{protocol}",
-            previous_value="present",
-            current_value="removed",
-        )
-
-    for key in sorted(old_ports.keys() & new_ports.keys()):
-        old = old_ports[key]
-        new = new_ports[key]
-
-        fields = [
-            "service",
-            "version",
-            "source",
-        ]
-
-        for field in fields:
-            old_value = getattr(old, field, None)
-            new_value = getattr(new, field, None)
-
-            if snapshot(old_value) != snapshot(new_value):
-                ip, port, protocol = key
-
-                add_change(
-                    "port",
-                    f"{ip}:{port}/{protocol}",
-                    previous_value=f"{field}={snapshot(old_value)}",
-                    current_value=f"{field}={snapshot(new_value)}",
-                )
-
-    # ---------------------------------------------------------
-    # INFRASTRUCTURE / IPs
-    # ---------------------------------------------------------
-    old_ips = {
-        x.ip: x
-        for x in db.scalars(
-            select(InfrastructureIP).where(
-                InfrastructureIP.scan_id == previous.id
-            )
-        ).all()
-    }
-
-    new_ips = {
-        x.ip: x
-        for x in db.scalars(
-            select(InfrastructureIP).where(
-                InfrastructureIP.scan_id == scan.id
-            )
-        ).all()
-    }
-
-    for ip in sorted(new_ips.keys() - old_ips.keys()):
-        add_change(
-            "ip",
-            ip,
-            previous_value=None,
-            current_value="new",
-        )
-
-    for ip in sorted(old_ips.keys() - new_ips.keys()):
-        add_change(
-            "ip",
-            ip,
-            previous_value="present",
-            current_value="removed",
-        )
-
-    for ip in sorted(old_ips.keys() & new_ips.keys()):
-        old = old_ips[ip]
-        new = new_ips[ip]
-
-        fields = [
-            "hostnames",
-            "cdn",
-            "cdn_name",
-            "waf_name",
-        ]
-
-        for field in fields:
-            old_value = getattr(old, field, None)
-            new_value = getattr(new, field, None)
-
-            if snapshot(old_value) != snapshot(new_value):
-                add_change(
-                    "ip",
-                    ip,
-                    previous_value=f"{field}={snapshot(old_value)}",
-                    current_value=f"{field}={snapshot(new_value)}",
-                )
-
-    # ---------------------------------------------------------
-    # FINDINGS
-    # ---------------------------------------------------------
-    old_findings = {
-        x.dedupe_key: x
-        for x in db.scalars(
-            select(Finding).where(Finding.scan_id == previous.id)
-        ).all()
-    }
-
-    new_findings = {
-        x.dedupe_key: x
-        for x in db.scalars(
-            select(Finding).where(Finding.scan_id == scan.id)
-        ).all()
-    }
-
-    for key in sorted(new_findings.keys() - old_findings.keys()):
-        finding = new_findings[key]
-
-        add_change(
-            "finding",
-            finding.name,
-            previous_value=None,
-            current_value="new",
-        )
-
-    for key in sorted(old_findings.keys() - new_findings.keys()):
-        finding = old_findings[key]
-
-        add_change(
-            "finding",
-            finding.name,
-            previous_value="present",
-            current_value="removed",
-        )
-
-    for key in sorted(old_findings.keys() & new_findings.keys()):
-        old = old_findings[key]
-        new = new_findings[key]
-
-        fields = [
-            "name",
-            "severity",
-            "target",
-            "status",
-        ]
-
-        for field in fields:
-            old_value = getattr(old, field, None)
-            new_value = getattr(new, field, None)
-
-            if snapshot(old_value) != snapshot(new_value):
-                add_change(
-                    "finding",
-                    new.name,
-                    previous_value=f"{field}={snapshot(old_value)}",
-                    current_value=f"{field}={snapshot(new_value)}",
-                )
-
+    old_findings = {x.dedupe_key for x in db.scalars(select(Finding).where(Finding.scan_id == previous.id)).all()}
+    new_findings = {x.dedupe_key for x in db.scalars(select(Finding).where(Finding.scan_id == scan.id)).all()}
+    for key in sorted(new_findings - old_findings):
+        f = db.scalar(select(Finding).where(Finding.scan_id == scan.id, Finding.dedupe_key == key))
+        if f:
+            db.add(Change(scan_id=scan.id, change_type="finding", asset=f.name, current_value="new"))
     db.commit()
+
 
 async def run_scan(scan_id: str):
     db = SessionLocal()
@@ -1531,7 +832,7 @@ async def run_ffuf(run_id: str):
     wordlist_path = None
 
     try:
-        wordlist = db.get(Wordlist, run.config.get("wordlist_id"))
+        wordlist = db.get(__import__("app.models", fromlist=["Wordlist"]).Wordlist, run.config.get("wordlist_id"))
         if not wordlist:
             raise RuntimeError("Wordlist not found")
 
@@ -1692,5 +993,3 @@ async def run_ffuf(run_id: str):
         except Exception:
             pass
         db.close()
-
-

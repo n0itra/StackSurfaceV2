@@ -1261,4 +1261,3 @@ async def scan_ws(
 
     except WebSocketDisconnect:
         return
-

@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import asyncio
 import json
@@ -18,10 +18,9 @@ from sqlalchemy.orm import Session
 from .config import settings
 from .db import SessionLocal
 from .models import (Scan, ScanStage, ToolRun, Subdomain, WebService, OpenPort, Endpoint,
-                     Directory, Secret, Finding, Change, FFUFRuns, FFUFEvent, Wordlist,
-                     InfrastructureIP)
+                     Directory, Secret, Finding, Change, FFUFRuns, FFUFEvent, InfrastructureIP)
+from .repository import previous_completed_scan, scan_counts
 from .utils import clean_host_lines, in_scope, mask_secret
-from .repository import previous_completed_scan
 
 
 FULL_STAGES = [
@@ -1041,368 +1040,32 @@ async def stage_changes(db: Session, scan: Scan):
     previous = previous_completed_scan(db, scan)
     if not previous:
         return
+    old_subs = {x.fqdn for x in db.scalars(select(Subdomain).where(Subdomain.scan_id == previous.id)).all()}
+    new_subs = {x.fqdn for x in db.scalars(select(Subdomain).where(Subdomain.scan_id == scan.id)).all()}
+    for fqdn in sorted(new_subs - old_subs):
+        db.add(Change(scan_id=scan.id, change_type="subdomain", asset=fqdn, current_value="new"))
+        row = db.scalar(select(Subdomain).where(Subdomain.scan_id == scan.id, Subdomain.fqdn == fqdn))
+        if row:
+            row.is_new = True
 
-    # Clear existing changes so rerunning the stage is deterministic.
-    db.query(Change).filter(Change.scan_id == scan.id).delete(
-        synchronize_session=False
-    )
-    db.flush()
+    old_urls = {x.url for x in db.scalars(select(Endpoint).where(Endpoint.scan_id == previous.id)).all()}
+    new_urls = {x.url for x in db.scalars(select(Endpoint).where(Endpoint.scan_id == scan.id)).all()}
+    for url in sorted(new_urls - old_urls):
+        db.add(Change(scan_id=scan.id, change_type="endpoint", asset=url, current_value="new"))
 
-    def snapshot(value):
-        if value is None:
-            return None
-        if isinstance(value, (dict, list, tuple, set)):
-            return json.dumps(value, sort_keys=True, default=str)
-        return str(value)
+    old_ports = {(x.ip, x.port, x.protocol) for x in db.scalars(select(OpenPort).where(OpenPort.scan_id == previous.id)).all()}
+    new_ports = {(x.ip, x.port, x.protocol) for x in db.scalars(select(OpenPort).where(OpenPort.scan_id == scan.id)).all()}
+    for ip, port, protocol in sorted(new_ports - old_ports):
+        db.add(Change(scan_id=scan.id, change_type="port", asset=f"{ip}:{port}/{protocol}", current_value="new"))
 
-    def add_change(
-        change_type,
-        asset,
-        previous_value=None,
-        current_value=None,
-    ):
-        db.add(
-            Change(
-                scan_id=scan.id,
-                change_type=change_type,
-                asset=str(asset),
-                previous_value=snapshot(previous_value),
-                current_value=snapshot(current_value),
-            )
-        )
-
-    # ---------------------------------------------------------
-    # SUBDOMAINS
-    # ---------------------------------------------------------
-    old_subs = {
-        x.fqdn: x
-        for x in db.scalars(
-            select(Subdomain).where(Subdomain.scan_id == previous.id)
-        ).all()
-    }
-
-    new_subs = {
-        x.fqdn: x
-        for x in db.scalars(
-            select(Subdomain).where(Subdomain.scan_id == scan.id)
-        ).all()
-    }
-
-    for fqdn in sorted(new_subs.keys() - old_subs.keys()):
-        add_change(
-            "subdomain",
-            fqdn,
-            previous_value=None,
-            current_value="new",
-        )
-        new_subs[fqdn].is_new = True
-
-    for fqdn in sorted(old_subs.keys() - new_subs.keys()):
-        add_change(
-            "subdomain",
-            fqdn,
-            previous_value="present",
-            current_value="removed",
-        )
-
-    # ---------------------------------------------------------
-    # ALIVE WEB SERVICES
-    # ---------------------------------------------------------
-    old_alive = {
-        x.url: x
-        for x in db.scalars(
-            select(WebService).where(WebService.scan_id == previous.id)
-        ).all()
-    }
-
-    new_alive = {
-        x.url: x
-        for x in db.scalars(
-            select(WebService).where(WebService.scan_id == scan.id)
-        ).all()
-    }
-
-    for url in sorted(new_alive.keys() - old_alive.keys()):
-        add_change(
-            "alive",
-            url,
-            previous_value=None,
-            current_value="new",
-        )
-
-    for url in sorted(old_alive.keys() - new_alive.keys()):
-        add_change(
-            "alive",
-            url,
-            previous_value="present",
-            current_value="removed",
-        )
-
-    for url in sorted(old_alive.keys() & new_alive.keys()):
-        old = old_alive[url]
-        new = new_alive[url]
-
-        fields = [
-            "status_code",
-            "title",
-            "ip",
-            "cdn",
-            "cdn_name",
-            "waf_name",
-            "technologies",
-        ]
-
-        for field in fields:
-            old_value = getattr(old, field, None)
-            new_value = getattr(new, field, None)
-
-            if snapshot(old_value) != snapshot(new_value):
-                add_change(
-                    "alive",
-                    url,
-                    previous_value=f"{field}={snapshot(old_value)}",
-                    current_value=f"{field}={snapshot(new_value)}",
-                )
-
-    # ---------------------------------------------------------
-    # ENDPOINTS
-    # ---------------------------------------------------------
-    old_endpoints = {
-        x.url: x
-        for x in db.scalars(
-            select(Endpoint).where(Endpoint.scan_id == previous.id)
-        ).all()
-    }
-
-    new_endpoints = {
-        x.url: x
-        for x in db.scalars(
-            select(Endpoint).where(Endpoint.scan_id == scan.id)
-        ).all()
-    }
-
-    for url in sorted(new_endpoints.keys() - old_endpoints.keys()):
-        add_change(
-            "endpoint",
-            url,
-            previous_value=None,
-            current_value="new",
-        )
-
-    for url in sorted(old_endpoints.keys() - new_endpoints.keys()):
-        add_change(
-            "endpoint",
-            url,
-            previous_value="present",
-            current_value="removed",
-        )
-
-    for url in sorted(old_endpoints.keys() & new_endpoints.keys()):
-        old = old_endpoints[url]
-        new = new_endpoints[url]
-
-        fields = [
-            "status_code",
-            "method",
-            "kind",
-            "source",
-        ]
-
-        for field in fields:
-            old_value = getattr(old, field, None)
-            new_value = getattr(new, field, None)
-
-            if snapshot(old_value) != snapshot(new_value):
-                add_change(
-                    "endpoint",
-                    url,
-                    previous_value=f"{field}={snapshot(old_value)}",
-                    current_value=f"{field}={snapshot(new_value)}",
-                )
-
-    # ---------------------------------------------------------
-    # PORTS
-    # ---------------------------------------------------------
-    def port_key(x):
-        return (x.ip, x.port, x.protocol)
-
-    old_ports = {
-        port_key(x): x
-        for x in db.scalars(
-            select(OpenPort).where(OpenPort.scan_id == previous.id)
-        ).all()
-    }
-
-    new_ports = {
-        port_key(x): x
-        for x in db.scalars(
-            select(OpenPort).where(OpenPort.scan_id == scan.id)
-        ).all()
-    }
-
-    for key in sorted(new_ports.keys() - old_ports.keys()):
-        ip, port, protocol = key
-        add_change(
-            "port",
-            f"{ip}:{port}/{protocol}",
-            previous_value=None,
-            current_value="new",
-        )
-
-    for key in sorted(old_ports.keys() - new_ports.keys()):
-        ip, port, protocol = key
-        add_change(
-            "port",
-            f"{ip}:{port}/{protocol}",
-            previous_value="present",
-            current_value="removed",
-        )
-
-    for key in sorted(old_ports.keys() & new_ports.keys()):
-        old = old_ports[key]
-        new = new_ports[key]
-
-        fields = [
-            "service",
-            "version",
-            "source",
-        ]
-
-        for field in fields:
-            old_value = getattr(old, field, None)
-            new_value = getattr(new, field, None)
-
-            if snapshot(old_value) != snapshot(new_value):
-                ip, port, protocol = key
-
-                add_change(
-                    "port",
-                    f"{ip}:{port}/{protocol}",
-                    previous_value=f"{field}={snapshot(old_value)}",
-                    current_value=f"{field}={snapshot(new_value)}",
-                )
-
-    # ---------------------------------------------------------
-    # INFRASTRUCTURE / IPs
-    # ---------------------------------------------------------
-    old_ips = {
-        x.ip: x
-        for x in db.scalars(
-            select(InfrastructureIP).where(
-                InfrastructureIP.scan_id == previous.id
-            )
-        ).all()
-    }
-
-    new_ips = {
-        x.ip: x
-        for x in db.scalars(
-            select(InfrastructureIP).where(
-                InfrastructureIP.scan_id == scan.id
-            )
-        ).all()
-    }
-
-    for ip in sorted(new_ips.keys() - old_ips.keys()):
-        add_change(
-            "ip",
-            ip,
-            previous_value=None,
-            current_value="new",
-        )
-
-    for ip in sorted(old_ips.keys() - new_ips.keys()):
-        add_change(
-            "ip",
-            ip,
-            previous_value="present",
-            current_value="removed",
-        )
-
-    for ip in sorted(old_ips.keys() & new_ips.keys()):
-        old = old_ips[ip]
-        new = new_ips[ip]
-
-        fields = [
-            "hostnames",
-            "cdn",
-            "cdn_name",
-            "waf_name",
-        ]
-
-        for field in fields:
-            old_value = getattr(old, field, None)
-            new_value = getattr(new, field, None)
-
-            if snapshot(old_value) != snapshot(new_value):
-                add_change(
-                    "ip",
-                    ip,
-                    previous_value=f"{field}={snapshot(old_value)}",
-                    current_value=f"{field}={snapshot(new_value)}",
-                )
-
-    # ---------------------------------------------------------
-    # FINDINGS
-    # ---------------------------------------------------------
-    old_findings = {
-        x.dedupe_key: x
-        for x in db.scalars(
-            select(Finding).where(Finding.scan_id == previous.id)
-        ).all()
-    }
-
-    new_findings = {
-        x.dedupe_key: x
-        for x in db.scalars(
-            select(Finding).where(Finding.scan_id == scan.id)
-        ).all()
-    }
-
-    for key in sorted(new_findings.keys() - old_findings.keys()):
-        finding = new_findings[key]
-
-        add_change(
-            "finding",
-            finding.name,
-            previous_value=None,
-            current_value="new",
-        )
-
-    for key in sorted(old_findings.keys() - new_findings.keys()):
-        finding = old_findings[key]
-
-        add_change(
-            "finding",
-            finding.name,
-            previous_value="present",
-            current_value="removed",
-        )
-
-    for key in sorted(old_findings.keys() & new_findings.keys()):
-        old = old_findings[key]
-        new = new_findings[key]
-
-        fields = [
-            "name",
-            "severity",
-            "target",
-            "status",
-        ]
-
-        for field in fields:
-            old_value = getattr(old, field, None)
-            new_value = getattr(new, field, None)
-
-            if snapshot(old_value) != snapshot(new_value):
-                add_change(
-                    "finding",
-                    new.name,
-                    previous_value=f"{field}={snapshot(old_value)}",
-                    current_value=f"{field}={snapshot(new_value)}",
-                )
-
+    old_findings = {x.dedupe_key for x in db.scalars(select(Finding).where(Finding.scan_id == previous.id)).all()}
+    new_findings = {x.dedupe_key for x in db.scalars(select(Finding).where(Finding.scan_id == scan.id)).all()}
+    for key in sorted(new_findings - old_findings):
+        f = db.scalar(select(Finding).where(Finding.scan_id == scan.id, Finding.dedupe_key == key))
+        if f:
+            db.add(Change(scan_id=scan.id, change_type="finding", asset=f.name, current_value="new"))
     db.commit()
+
 
 async def run_scan(scan_id: str):
     db = SessionLocal()
@@ -1531,7 +1194,7 @@ async def run_ffuf(run_id: str):
     wordlist_path = None
 
     try:
-        wordlist = db.get(Wordlist, run.config.get("wordlist_id"))
+        wordlist = db.get(__import__("app.models", fromlist=["Wordlist"]).Wordlist, run.config.get("wordlist_id"))
         if not wordlist:
             raise RuntimeError("Wordlist not found")
 
@@ -1692,5 +1355,3 @@ async def run_ffuf(run_id: str):
         except Exception:
             pass
         db.close()
-
-
