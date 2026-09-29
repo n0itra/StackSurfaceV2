@@ -1,0 +1,195 @@
+warning: in the working copy of 'backend/app/main.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/app/pipeline.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'frontend/assets/css/styles.css', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'frontend/assets/js/app.js', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'frontend/index.html', LF will be replaced by CRLF the next time Git touches it
+[1mdiff --git a/backend/app/main.py b/backend/app/main.py[m
+[1mindex 29dc3d4..b2d117f 100644[m
+[1m--- a/backend/app/main.py[m
+[1m+++ b/backend/app/main.py[m
+[36m@@ -130,8 +130,7 @@[m [mdef dashboard():[m
+             or 0[m
+         )[m
+ [m
+[31m-        recent_changes = db.scalars([m
+[31m-            select(Change, Scan, Target)[m
+[32m+[m[32m        recent_changes = db.execute(select(Change, Scan, Target)[m
+             .join(Scan, Change.scan_id == Scan.id)[m
+             .join(Target, Scan.target_id == Target.id)[m
+             .order_by(Change.id.desc())[m
+[36m@@ -389,6 +388,36 @@[m [mdef cancel_scan(scan_id: str):[m
+     return stop_scan(scan_id)[m
+ [m
+ [m
+[32m+[m
+[32m+[m[32m@app.delete("/api/scans/{scan_id}")[m
+[32m+[m[32mdef delete_scan(scan_id: str):[m
+[32m+[m[32m    with SessionLocal() as db:[m
+[32m+[m[32m        scan = db.get(Scan, scan_id)[m
+[32m+[m
+[32m+[m[32m        if not scan:[m
+[32m+[m[32m            raise HTTPException([m
+[32m+[m[32m                404,[m
+[32m+[m[32m                "Scan not found",[m
+[32m+[m[32m            )[m
+[32m+[m
+[32m+[m[32m        if scan.status in {[m
+[32m+[m[32m            "queued",[m
+[32m+[m[32m            "running",[m
+[32m+[m[32m            "stopping",[m
+[32m+[m[32m        }:[m
+[32m+[m[32m            raise HTTPException([m
+[32m+[m[32m                409,[m
+[32m+[m[32m                "Cannot delete an active scan. Stop it first and wait until it finishes.",[m
+[32m+[m[32m            )[m
+[32m+[m
+[32m+[m[32m        db.delete(scan)[m
+[32m+[m[32m        db.commit()[m
+[32m+[m
+[32m+[m[32m    return {[m
+[32m+[m[32m        "ok": True,[m
+[32m+[m[32m        "scan_id": scan_id,[m
+[32m+[m[32m        "status": "deleted",[m
+[32m+[m[32m    }[m
+ # ---------------------------------------------------------------------------[m
+ # Scan event stream[m
+ # ---------------------------------------------------------------------------[m
+[36m@@ -1131,6 +1160,49 @@[m [mdef create_ffuf_run([m
+         )[m
+ [m
+ [m
+[32m+[m[32m@app.post([m
+[32m+[m[32m    "/api/ffuf-runs/{run_id}/stop",[m
+[32m+[m[32m    response_model=FFUFOut,[m
+[32m+[m[32m)[m
+[32m+[m[32mdef stop_ffuf_run([m
+[32m+[m[32m    run_id: str,[m
+[32m+[m[32m):[m
+[32m+[m[32m    with SessionLocal() as db:[m
+[32m+[m[32m        run = db.get([m
+[32m+[m[32m            FFUFRuns,[m
+[32m+[m[32m            run_id,[m
+[32m+[m[32m        )[m
+[32m+[m
+[32m+[m[32m        if not run:[m
+[32m+[m[32m            raise HTTPException([m
+[32m+[m[32m                404,[m
+[32m+[m[32m                "FFUF run not found",[m
+[32m+[m[32m            )[m
+[32m+[m
+[32m+[m[32m        if run.status in {[m
+[32m+[m[32m            "completed",[m
+[32m+[m[32m            "failed",[m
+[32m+[m[32m            "cancelled",[m
+[32m+[m[32m        }:[m
+[32m+[m[32m            return FFUFOut.model_validate(run)[m
+[32m+[m
+[32m+[m[32m        if run.status == "stopping":[m
+[32m+[m[32m            return FFUFOut.model_validate(run)[m
+[32m+[m
+[32m+[m[32m        if run.status == "queued":[m
+[32m+[m[32m            run.status = "cancelled"[m
+[32m+[m[32m            run.error = "FFUF stopped by user before execution"[m
+[32m+[m[32m            run.finished_at = datetime.now(timezone.utc)[m
+[32m+[m[32m        else:[m
+[32m+[m[32m            run.status = "stopping"[m
+[32m+[m[32m            run.error = "FFUF stop requested by user"[m
+[32m+[m
+[32m+[m[32m        db.commit()[m
+[32m+[m[32m        db.refresh(run)[m
+[32m+[m
+[32m+[m[32m        return FFUFOut.model_validate(run)[m
+[32m+[m
+[32m+[m
+ @app.get([m
+     "/api/ffuf-runs/{run_id}",[m
+     response_model=FFUFOut,[m
+[36m@@ -1196,6 +1268,7 @@[m [masync def ffuf_stream([m
+                 if run.status in {[m
+                     "completed",[m
+                     "failed",[m
+[32m+[m[32m                    "cancelled",[m
+                 }:[m
+                     yield ([m
+                         "event: done\n"[m
+[36m@@ -1262,3 +1335,7 @@[m [masync def scan_ws([m
+     except WebSocketDisconnect:[m
+         return[m
+ [m
+[41m+[m
+[41m+[m
+[41m+[m
+[41m+[m
+[1mdiff --git a/backend/app/pipeline.py b/backend/app/pipeline.py[m
+[1mindex 69d799e..9c97cce 100644[m
+[1m--- a/backend/app/pipeline.py[m
+[1m+++ b/backend/app/pipeline.py[m
+[36m@@ -999,6 +999,14 @@[m [masync def stage_js_analysis(db: Session, scan: Scan):[m
+             for obj in parse_json_lines([m
+                 res.stdout[m
+             ):[m
+[32m+[m[32m                print([m
+[32m+[m[32m    "TRUFFLEHOG RAW TYPES:",[m
+[32m+[m[32m    {[m
+[32m+[m[32m        k: type(v).__name__[m
+[32m+[m[32m        for k, v in obj.items()[m
+[32m+[m[32m    }[m
+[32m+[m[32m)[m
+[32m+[m
+                 reason = ([m
+                     obj.get("DetectorName")[m
+                     or obj.get("detector_name")[m
+[36m@@ -1508,6 +1516,19 @@[m [mdef recover_stale_jobs() -> None:[m
+             scan.status = "failed"[m
+             scan.error = "Worker restarted while this scan was running"[m
+             scan.finished_at = utcnow()[m
+[32m+[m[32m        # A worker restart terminates child FFUF processes.[m
+[32m+[m[32m        # Mark any FFUF run left in running/stopping as cancelled.[m
+[32m+[m[32m        stale_ffuf = db.scalars([m
+[32m+[m[32m            select(FFUFRuns).where([m
+[32m+[m[32m                FFUFRuns.status.in_(["running", "stopping"])[m
+[32m+[m[32m            )[m
+[32m+[m[32m        ).all()[m
+[32m+[m
+[32m+[m[32m        for run in stale_ffuf:[m
+[32m+[m[32m            run.status = "cancelled"[m
+[32m+[m[32m            run.error = "FFUF process ended when worker restarted"[m
+[32m+[m[32m            run.finished_at = utcnow()[m
+[32m+[m
+         db.commit()[m
+ [m
+         queued = db.scalars(select(Scan).where(Scan.status == "queued")).all()[m
+[36m@@ -1525,6 +1546,20 @@[m [masync def run_ffuf(run_id: str):[m
+         db.close()[m
+         return[m
+ [m
+[32m+[m[32m    # Only a queued FFUF job may start a new process.[m
+[32m+[m[32m    # This prevents duplicate Redis messages from launching the same job twice.[m
+[32m+[m[32m    if run.status == "stopping":[m
+[32m+[m[32m        run.status = "cancelled"[m
+[32m+[m[32m        run.error = "FFUF stopped by user before execution"[m
+[32m+[m[32m        run.finished_at = utcnow()[m
+[32m+[m[32m        db.commit()[m
+[32m+[m[32m        db.close()[m
+[32m+[m[32m        return[m
+[32m+[m
+[32m+[m[32m    if run.status != "queued":[m
+[32m+[m[32m        db.close()[m
+[32m+[m[32m        return[m
+[32m+[m
+     run.status = "running"[m
+     run.started_at = utcnow()[m
+     db.commit()[m
+[36m@@ -1611,8 +1646,8 @@[m [masync def run_ffuf(run_id: str):[m
+             while proc.returncode is None:[m
+                 check_db = SessionLocal()[m
+                 try:[m
+[31m-                    scan = check_db.get(Scan, run.scan_id)[m
+[31m-                    if scan and scan.cancel_requested:[m
+[32m+[m[32m                    current = check_db.get(FFUFRuns, run_id)[m
+[32m+[m[32m                    if current and current.status == "stopping":[m
+                         return True[m
+                 finally:[m
+                     check_db.close()[m
+[36m@@ -1647,7 +1682,7 @@[m [masync def run_ffuf(run_id: str):[m
+         run.output = "\n".join(chunks[

@@ -23,9 +23,7 @@ def main() -> None:
 
     while True:
         try:
-            logging.info('WORKER LOOP: checking queue len=%s', redis_client.llen(JOB_QUEUE))
             item = redis_client.lpop(JOB_QUEUE)
-            logging.info('WORKER LOOP: lpop result=%r', item)
 
             if not item:
                 time.sleep(0.5)
@@ -43,13 +41,6 @@ def main() -> None:
                 elif job_type == "ffuf":
                     asyncio.run(
                         run_ffuf(payload["run_id"])
-                    )
-
-                elif job_type == "nmap":
-                    from .app.nmap_service import run_nmap
-                
-                    asyncio.run(
-                        run_nmap(payload["run_id"])
                     )
 
                 else:

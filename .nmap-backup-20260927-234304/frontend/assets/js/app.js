@@ -1,0 +1,4932 @@
+﻿const state={
+  page:'dashboard',
+  scanId:null,
+  scan:null,
+  assetTab:'subdomains',
+  ffufRunId:null,
+  ffufEventSource:null,
+  ffufTargetUrl:null,
+  scanEventSource:null,
+  selectedProfile:'full',
+
+  resourceRows:[],
+  resourceRes:null,
+  resourceHostId:null,
+  resourceSort:{
+    field:null,
+    direction:'asc'
+  },
+
+  resourcePage:1,
+  resourceLimit:100,
+  resourceTotal:0,
+  resourcePages:0
+};
+
+/* =========================================================
+   Navigation persistence
+   ========================================================= */
+
+const VALID_PAGES=new Set([
+  'dashboard',
+  'scans',
+  'assets',
+  'changes',
+  'findings',
+  'scan-detail',
+  'scan-ffuf'
+]);
+
+const NAVIGATION_STORAGE_KEY='stacksurface-navigation';
+
+function saveNavigationState(){
+  try{
+    sessionStorage.setItem(
+      NAVIGATION_STORAGE_KEY,
+      JSON.stringify({
+        page:state.page,
+        scanId:state.scanId,
+        assetTab:state.assetTab,
+        ffufHost:state.ffufHost||null,
+        ffufTargetUrl:state.ffufTargetUrl||null,
+        ffufRunId:state.ffufRunId||null
+      })
+    );
+  }catch{}
+}
+
+function restoreNavigationState(){
+  try{
+    const raw=
+      sessionStorage.getItem(
+        NAVIGATION_STORAGE_KEY
+      );
+
+    if(!raw){
+      return;
+    }
+
+    const saved=JSON.parse(raw);
+
+    if(!saved||!VALID_PAGES.has(saved.page)){
+      sessionStorage.removeItem(
+        NAVIGATION_STORAGE_KEY
+      );
+      return;
+    }
+
+    if(
+      (saved.page==='scan-detail'||
+       saved.page==='scan-ffuf') &&
+      !saved.scanId
+    ){
+      return;
+    }
+
+    state.page=saved.page;
+    state.scanId=saved.scanId||null;
+    state.assetTab=saved.assetTab||'subdomains';
+
+    if(saved.ffufHost){
+      state.ffufHost=saved.ffufHost;
+    }
+
+    if(saved.ffufTargetUrl){
+      state.ffufTargetUrl=saved.ffufTargetUrl;
+    }
+
+    if(saved.ffufRunId){
+      state.ffufRunId=saved.ffufRunId;
+    }
+  }catch{
+    sessionStorage.removeItem(
+      NAVIGATION_STORAGE_KEY
+    );
+  }
+}
+
+const profileSummary={
+  full:'runs the complete discovery, infrastructure, web and vulnerability pipeline.',
+  discovery:'finds subdomains, resolves them and keeps the requested HTTP statuses.',
+  web:'works from the current target surface and focuses on crawling, endpoints, technologies and WAF.',
+  vuln:'uses the existing web surface for Nuclei, JavaScript and secret analysis.'
+};
+
+const terminalStatuses=new Set([
+  'completed',
+  'completed_with_warnings',
+  'failed',
+  'cancelled'
+]);
+
+const $=id=>document.getElementById(id);
+
+function esc(v){
+  return String(v??'').replace(/[&<>'"]/g,c=>({
+    '&':'&amp;',
+    '<':'&lt;',
+    '>':'&gt;',
+    "'":'&#39;',
+    '"':'&quot;'
+  }[c]));
+}
+
+function hideScanIds(v){
+  return String(v??'')
+    .replace(
+      /[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/gi,
+      ''
+    )
+    .replace(/\s{2,}/g,' ')
+    .trim();
+}
+
+function toast(msg){
+  $('toast').textContent=hideScanIds(msg);
+  $('toast').classList.add('show');
+  setTimeout(()=>$('toast').classList.remove('show'),4500)
+}
+
+async function api(url,opts={}){
+  const r=await fetch(
+    url,
+    {
+      headers:{
+        'Content-Type':'application/json',
+        ...(opts.headers||{})
+      },
+      ...opts
+    }
+  );
+
+  let data=null;
+
+  try{
+    data=await r.json()
+  }catch{}
+
+  if(!r.ok){
+    const msg=
+      data?.detail?.message||
+      data?.detail||
+      data?.message||
+      `Request failed (${r.status})`;
+
+    throw new Error(
+      typeof msg==='string'
+        ? msg
+        : JSON.stringify(msg)
+    );
+  }
+
+  return data;
+}
+
+function openPage(page){
+  stopScanStream();
+  stopFfufStream();
+
+  state.page=page;
+  saveNavigationState();
+
+  document
+    .querySelectorAll('.page')
+    .forEach(
+      p=>p.classList.remove('active')
+    );
+
+  const el=$('page-'+page);
+
+  if(el){
+    el.classList.add('active');
+  }
+
+  document
+    .querySelectorAll('#nav button')
+    .forEach(
+      b=>b.classList.toggle(
+        'active',
+        b.dataset.page===page
+      )
+    );
+
+  renderPage();
+}
+
+function renderPage(){
+  if(state.page==='dashboard'){
+    loadDashboard();
+  }else if(state.page==='scans'){
+    loadScans();
+  }else if(state.page==='assets'){
+    loadAssets();
+  }else if(state.page==='changes'){
+    loadChanges();
+  }else if(state.page==='findings'){
+    loadFindings();
+  }else if(state.page==='scan-detail'){
+    loadScanDetail();
+  }else if(state.page==='scan-ffuf'){
+    renderFfufPage();
+  }
+}
+
+function stopScanStream(){
+  if(state.scanEventSource){
+    state.scanEventSource.close();
+    state.scanEventSource=null
+  }
+}
+
+function stopFfufStream(){
+  if(state.ffufEventSource){
+    state.ffufEventSource.close();
+    state.ffufEventSource=null
+  }
+}
+
+function setEngine(healthy){
+  $('healthPill').textContent=
+    healthy?'ONLINE':'DEGRADED';
+
+  $('healthPill').style.borderColor=
+    healthy?'#24513f':'#5b313b';
+
+  $('healthText').textContent=
+    healthy
+      ? 'API · PostgreSQL · Redis'
+      : 'Check /api/health';
+
+  $('engineBar').style.width=
+    healthy?'100%':'30%';
+}
+
+async function refreshHealth(){
+  try{
+    const d=await api('/api/health');
+    setEngine(d.status==='ok')
+  }catch{
+    setEngine(false)
+  }
+}
+
+async function activeScan(){
+  const scans=
+    await api('/api/scans?limit=10');
+
+  return scans.find(
+    s=>[
+      'queued',
+      'running',
+      'stopping'
+    ].includes(s.status)
+  )||null
+}
+
+async function syncHeader(){
+  try{
+    const a=await activeScan();
+
+    $('newScanBtn').disabled=!!a;
+
+    $('newScanBtn').title=
+      a
+        ? 'A scan is already active'
+        : 'Start a new scan';
+  }catch{}
+}
+
+function profileSelect(name){
+  state.selectedProfile=name;
+
+  document
+    .querySelectorAll('.compact-scan-type')
+    .forEach(
+      x=>x.classList.toggle(
+        'selected',
+        x.dataset.profile===name
+      )
+    );
+
+  $('profileSummary').innerHTML=`
+    <strong>${
+      name==='full'
+        ? 'Full Recon'
+        : name==='discovery'
+          ? 'Discovery'
+          : name==='web'
+            ? 'Web Surface'
+            : 'Vulnerability Focus'
+    }</strong>
+    ${profileSummary[name]}
+  `
+}
+
+function selectProfile(name){
+  profileSelect(name)
+}
+
+function openModal(){
+  syncHeader().then(()=>{
+    if($('newScanBtn').disabled){
+      toast(
+        'A scan is already running. Stop it before starting another.'
+      );
+      return
+    }
+
+    $('scanModal').classList.add('show');
+    profileSelect(state.selectedProfile)
+  })
+}
+
+function closeModal(){
+  $('scanModal').classList.remove('show')
+}
+
+async function createScan(){
+  const links=
+    $('targetLinks')
+      .value
+      .split(/\n|,/)
+      .map(x=>x.trim())
+      .filter(Boolean);
+
+  if(!links.length){
+    toast('Enter at least one target link.');
+    return
+  }
+
+  const btn=$('startScanBtn');
+
+  btn.disabled=true;
+  btn.textContent='Starting…';
+
+  try{
+    const scan=
+      await api(
+        '/api/scans',
+        {
+          method:'POST',
+          body:JSON.stringify({
+            links,
+            scan_type:state.selectedProfile
+          })
+        }
+      );
+
+    closeModal();
+
+    state.scanId=scan.id;
+    state.scan=scan;
+
+    openPage('scan-detail');
+
+    toast('Scan started.');
+
+  }catch(e){
+    toast(e.message)
+
+  }finally{
+    btn.disabled=false;
+    btn.textContent='Start Scan';
+    syncHeader()
+  }
+}
+
+async function stopScan(id){
+  if(
+    !confirm(
+      'Stop this scan? The running security tool will be terminated and the scan will be marked stopped.'
+    )
+  ){
+    return
+  }
+
+  try{
+    await api(
+      `/api/scans/${id}/stop`,
+      {
+        method:'POST'
+      }
+    );
+
+    toast('Stop requested.');
+    openScan(id)
+
+  }catch(e){
+    toast(e.message)
+  }
+}
+
+async function deleteScan(id){
+  if(
+    !confirm(
+      'Delete this scan permanently? All assets, findings, endpoints, FFUF runs, and scan data will be removed.'
+    )
+  ){
+    return
+  }
+
+  try{
+    await api(
+      `/api/scans/${id}`,
+      {
+        method:'DELETE'
+      }
+    );
+
+    stopScanStream();
+    stopFfufStream();
+
+    state.scanId=null;
+    state.scan=null;
+    state.ffufRunId=null;
+    state.ffufHost=null;
+    state.ffufTargetUrl=null;
+
+    saveNavigationState();
+
+    toast('Scan deleted.');
+    openPage('scans');
+
+  }catch(e){
+    toast(e.message);
+  }
+}
+function openScan(id){
+  state.scanId=id;
+  saveNavigationState();
+  openPage('scan-detail')
+}
+
+function statusBadge(status){
+  const map={
+    running:'cyan',
+    stopping:'yellow',
+    queued:'yellow',
+    completed:'green',
+    completed_with_warnings:'yellow',
+    failed:'red',
+    cancelled:'gray'
+  };
+
+  return `
+    <span class="badge ${map[status]||'gray'}">
+      ${esc(
+        status
+          .replaceAll('_',' ')
+          .toUpperCase()
+      )}
+    </span>
+  `
+}
+
+function statusDot(status){
+  const c=
+    status==='running'
+      ? 'run'
+      : status==='stopping'||status==='queued'
+        ? 'warn-dot'
+        : terminalStatuses.has(status)
+          ? 'ok'
+          : 'bad-dot';
+
+  return `
+    <span class="status">
+      <i class="${c}"></i>
+      ${esc(status.replaceAll('_',' '))}
+    </span>
+  `
+}
+
+
+/* =========================================================
+   Resource table helpers
+   ========================================================= */
+
+function isIpAddress(value){
+  const s=String(value??'').trim();
+
+  if(!s){
+    return false;
+  }
+
+  if(
+    /^(?:\d{1,3}\.){3}\d{1,3}$/.test(s)
+  ){
+    return s
+      .split('.')
+      .every(
+        part=>
+          Number(part)>=0 &&
+          Number(part)<=255
+      );
+  }
+
+  return (
+    /^[0-9a-fA-F:]+$/.test(s) &&
+    s.includes(':')
+  );
+}
+
+
+function faviconMarkup(url){
+  try{
+    const u=new URL(url);
+    const favicon=`${u.origin}/favicon.ico`;
+
+    return `
+      <span
+        class="webapp-icon"
+        aria-hidden="true"
+        style="
+          display:inline-flex;
+          align-items:center;
+          justify-content:center;
+          width:18px;
+          height:18px;
+          margin-right:8px;
+          vertical-align:middle
+        "
+      >
+        <img
+          src="${esc(favicon)}"
+          alt=""
+          loading="lazy"
+          style="
+            width:18px;
+            height:18px;
+            object-fit:contain;
+            border-radius:4px
+          "
+          onerror="
+            this.style.display='none';
+            this.nextElementSibling.style.display='inline-flex'
+          "
+        >
+
+        <span
+          class="webapp-fallback"
+          style="
+            display:none;
+            align-items:center;
+            justify-content:center;
+            width:18px;
+            height:18px;
+            border:1px solid #2b3d52;
+            border-radius:4px;
+            font-size:11px;
+            color:#7f96aa
+          "
+        >
+          ◉
+        </span>
+      </span>
+    `;
+
+  }catch{
+    return `
+      <span
+        class="webapp-icon"
+        aria-hidden="true"
+        style="
+          display:inline-flex;
+          align-items:center;
+          justify-content:center;
+          width:18px;
+          height:18px;
+          margin-right:8px;
+          vertical-align:middle
+        "
+      >
+        <span
+          class="webapp-fallback"
+          style="
+            display:inline-flex;
+            align-items:center;
+            justify-content:center;
+            width:18px;
+            height:18px;
+            border:1px solid #2b3d52;
+            border-radius:4px;
+            font-size:11px;
+            color:#7f96aa
+          "
+        >
+          ◉
+        </span>
+      </span>
+    `;
+  }
+}
+
+
+function normalizeSortValue(value){
+  if(Array.isArray(value)){
+    return value.join(', ');
+  }
+
+  if(
+    value===null||
+    value===undefined
+  ){
+    return '';
+  }
+
+  return String(value);
+}
+
+
+function compareResourceValues(a,b,field){
+  const av=a?.[field];
+  const bv=b?.[field];
+
+  const aEmpty=
+    av===null||
+    av===undefined||
+    av==='';
+
+  const bEmpty=
+    bv===null||
+    bv===undefined||
+    bv==='';
+
+  /*
+   * Empty values always go to the bottom.
+   */
+  if(aEmpty&&bEmpty){
+    return 0;
+  }
+
+  if(aEmpty){
+    return 1;
+  }
+
+  if(bEmpty){
+    return -1;
+  }
+
+  /*
+   * Numeric columns use real numeric comparison.
+   *
+   * This is important for status codes:
+   *
+   * 200
+   * 401
+   * 403
+   * 404
+   *
+   * rather than lexicographical ordering.
+   */
+  if(
+    field==='status_code'||
+    field==='port'||
+    field==='words'||
+    field==='lines'||
+    field==='size'
+  ){
+    const an=Number(av);
+    const bn=Number(bv);
+
+    if(
+      !Number.isNaN(an) &&
+      !Number.isNaN(bn)
+    ){
+      return an-bn;
+    }
+  }
+
+  /*
+   * Technologies, WAF names, URLs,
+   * hostnames, etc. are sorted naturally.
+   */
+  return normalizeSortValue(av).localeCompare(
+    normalizeSortValue(bv),
+    undefined,
+    {
+      numeric:true,
+      sensitivity:'base'
+    }
+  );
+}
+
+
+function sortIndicator(field){
+  if(
+    state.resourceSort.field!==field
+  ){
+    return '';
+  }
+
+  return state.resourceSort.direction==='asc'
+    ? ' ↑'
+    : ' ↓';
+}
+
+
+function setResourceSort(field){
+  if(
+    state.resourceSort.field===field
+  ){
+    state.resourceSort.direction=
+      state.resourceSort.direction==='asc'
+        ? 'desc'
+        : 'asc';
+  }else{
+    state.resourceSort.field=field;
+    state.resourceSort.direction='asc';
+  }
+
+  rerenderCurrentResourceTable();
+}
+
+
+function resourceDisplay(row,field,res){
+  const value=row?.[field];
+
+  if(field==='url'){
+    return `
+      <div class="webapp-url">
+        ${
+          res==='alive'
+            ? faviconMarkup(value)
+            : ''
+        }
+
+        <span class="mono">
+          ${esc(value??'—')}
+        </span>
+      </div>
+    `;
+  }
+
+  /*
+   * Never display a hostname in the IP column.
+   */
+  if(field==='ip'){
+    return isIpAddress(value)
+      ? `
+          <span class="mono">
+            ${esc(value)}
+          </span>
+        `
+      : `
+          <span class="muted">
+            —
+          </span>
+        `;
+  }
+
+  if(field==='technologies'){
+    return esc(
+      Array.isArray(value)
+        ? value.join(', ')
+        : (value??'—')
+    );
+  }
+
+  if(field==='sources'){
+    return esc(
+      Array.isArray(value)
+        ? value.join(', ')
+        : (value??'—')
+    );
+  }
+
+  if(field==='hostnames'){
+    return esc(
+      Array.isArray(value)
+        ? value.join(', ')
+        : (value??'—')
+    );
+  }
+
+  if(field==='status_code'){
+    return (
+      value===null||
+      value===undefined||
+      value===''
+    )
+      ? `
+          <span class="muted">
+            —
+          </span>
+        `
+      : esc(value);
+  }
+
+  if(field==='waf_name'){
+    return esc(value||'—');
+  }
+
+  if(typeof value==='boolean'){
+    return value
+      ? 'true'
+      : 'false';
+  }
+
+  if(Array.isArray(value)){
+    return esc(
+      value.join(', ')
+    );
+  }
+
+  return esc(value??'—');
+}
+
+
+function resourceFields(res){
+  return {
+    subdomains:[
+      'fqdn',
+      'sources',
+      'is_new'
+    ],
+
+    alive:[
+      'url',
+      'status_code',
+      'title',
+      'ip',
+      'technologies',
+      'waf_name'
+    ],
+
+    ips:[
+      'ip',
+      'hostnames',
+      'cdn',
+      'cdn_name',
+      'waf_name'
+    ],
+
+    ports:[
+      'ip',
+      'port',
+      'protocol',
+      'service',
+      'version',
+      'source'
+    ],
+
+    endpoints:[
+      'url',
+      'source',
+      'status_code',
+      'method',
+      'kind'
+    ],
+
+    directories:[
+      'url',
+      'status_code',
+      'words',
+      'lines',
+      'size'
+    ],
+
+    technologies:[
+      'url',
+      'technologies'
+    ],
+
+    waf:[
+      'url',
+      'waf_name'
+    ],
+
+    secrets:[
+      'source',
+      'kind',
+      'location',
+      'value_masked',
+      'severity',
+      'verified'
+    ],
+
+    findings:[
+      'name',
+      'tool',
+      'severity',
+      'target',
+      'status'
+    ]
+
+  }[res]||[];
+}
+
+
+/*
+ * One generic resource table renderer.
+ *
+ * There are NO dropdown filters here.
+ *
+ * The column headers themselves are the sorting
+ * controls, exactly as requested.
+ */
+function renderResourceTable(
+  host,
+  res,
+  rows,
+  fields,
+  extraHeader='',
+  extraCell=''
+){
+  state.resourceRows=
+    Array.isArray(rows)
+      ? rows
+      : [];
+
+  state.resourceRes=res;
+  state.resourceHostId=host.id;
+
+  const sorted=[
+    ...state.resourceRows
+  ];
+
+  if(state.resourceSort.field){
+    const field=
+      state.resourceSort.field;
+
+    const direction=
+      state.resourceSort.direction==='asc'
+        ? 1
+        : -1;
+
+    sorted.sort(
+      (a,b)=>
+        compareResourceValues(
+          a,
+          b,
+          field
+        )*direction
+    );
+  }
+
+  host.innerHTML=`
+    <div class="table-wrap">
+
+      <table class="table">
+
+        <thead>
+
+          <tr>
+
+            ${fields.map(f=>`
+              <th
+                role="button"
+                tabindex="0"
+                onclick="setResourceSort('${f}')"
+                onkeydown="
+                  if(
+                    event.key==='Enter' ||
+                    event.key===' '
+                  ){
+                    event.preventDefault();
+                    setResourceSort('${f}')
+                  }
+                "
+                style="
+                  cursor:pointer;
+                  user-select:none
+                "
+                title="Sort by ${esc(
+                  f.replaceAll('_',' ')
+                )}"
+              >
+                ${esc(
+                  f.replaceAll('_',' ')
+                )}${sortIndicator(f)}
+              </th>
+            `).join('')}
+
+            ${extraHeader}
+
+          </tr>
+
+        </thead>
+
+        <tbody>
+
+          ${
+            sorted.length
+
+              ? sorted.map(r=>`
+                  <tr>
+
+                    ${fields.map(f=>`
+                      <td>
+                        ${resourceDisplay(
+                          r,
+                          f,
+                          res
+                        )}
+                      </td>
+                    `).join('')}
+
+                    ${
+                      extraCell
+                        ? extraCell(r)
+                        : ''
+                    }
+
+                  </tr>
+                `).join('')
+
+              : `
+                <tr>
+                  <td
+                    colspan="${
+                      fields.length+
+                      (extraHeader?1:0)
+                    }"
+                    class="empty"
+                  >
+                    No data recorded.
+                  </td>
+                </tr>
+              `
+          }
+
+        </tbody>
+
+      </table>
+
+    </div>
+  `;
+}
+
+
+function resetResourceTableState(){
+  state.resourceRows=[];
+  state.resourceRes=null;
+  state.resourceHostId=null;
+
+  state.resourceSort={
+    field:null,
+    direction:'asc'
+  };
+
+  state.resourcePage=1;
+  state.resourceLimit=100;
+  state.resourceTotal=0;
+  state.resourcePages=0;
+}
+
+
+function rerenderCurrentResourceTable(){
+  const host=
+    state.resourceHostId
+      ? $(state.resourceHostId)
+      : null;
+
+  if(
+    !host||
+    !state.resourceRes
+  ){
+    return;
+  }
+
+  const fields=
+    resourceFields(
+      state.resourceRes
+    );
+
+  if(!fields.length){
+    return;
+  }
+
+  const extraHeader=
+    state.resourceRes==='subdomains'
+      ? '<th>FFUF</th>'
+      : '';
+
+  const extraCell=
+    state.resourceRes==='subdomains'
+      ? row=>`
+          <td>
+
+            <button
+              class="btn"
+              onclick="openScanFfuf('${esc(row.fqdn||'')}')"
+            >
+              FFUF
+            </button>
+
+          </td>
+        `
+      : '';
+
+  renderResourceTable(
+    host,
+    state.resourceRes,
+    state.resourceRows,
+    fields,
+    extraHeader,
+    extraCell
+  );
+}
+
+
+/* =========================================================
+   Dashboard
+   ========================================================= */
+
+async function loadDashboard(){
+  const el=$('page-dashboard');
+
+  el.innerHTML=
+    '<div class="empty"><span class="spinner"></span> Loading dashboard…</div>';
+
+  try{
+    const [
+      d,
+      scans
+    ]=await Promise.all([
+      api('/api/dashboard'),
+      api('/api/scans?limit=8')
+    ]);
+
+    const active=
+      scans.find(
+        s=>[
+          'running',
+          'stopping',
+          'queued'
+        ].includes(s.status)
+      );
+
+    el.innerHTML=`
+      <div class="head">
+
+        <div>
+
+          <h2>
+            Surface Overview
+          </h2>
+
+          <p>
+            Local attack-surface visibility
+            driven by PostgreSQL-backed scan results.
+          </p>
+
+        </div>
+
+        <span
+          class="badge ${active?'cyan':'green'}"
+        >
+          ${active?'SCAN ACTIVE':'IDLE'}
+        </span>
+
+      </div>
+
+      <div class="kpis">
+
+        <div class="kpi">
+          <div class="tiny">
+            Targets
+          </div>
+
+          <div class="v">
+            ${d.targets}
+          </div>
+
+          <div class="delta">
+            canonical target groups
+          </div>
+        </div>
+
+        <div class="kpi">
+          <div class="tiny">
+            Subdomains
+          </div>
+
+          <div class="v">
+            ${d.subdomains}
+          </div>
+
+          <div class="delta">
+            discovered assets
+          </div>
+        </div>
+
+        <div class="kpi">
+          <div class="tiny">
+            Alive Web
+          </div>
+
+          <div class="v">
+            ${d.alive}
+          </div>
+
+          <div class="delta">
+            200 · 401 · 403 · 404
+          </div>
+        </div>
+
+        <div class="kpi">
+          <div class="tiny">
+            Endpoints
+          </div>
+
+          <div class="v">
+            ${d.endpoints}
+          </div>
+
+          <div class="delta">
+            historical + crawled
+          </div>
+        </div>
+
+        <div class="kpi warn">
+          <div class="tiny">
+            Findings
+          </div>
+
+          <div class="v">
+            ${d.findings}
+          </div>
+
+          <div class="delta">
+            bugs / exposures
+          </div>
+        </div>
+
+      </div>
+
+      <div class="grid2">
+
+        <div class="card">
+
+          <div class="card-head">
+
+            <h3>
+              Current Scan
+            </h3>
+
+            <span class="tiny">
+              one active scan maximum
+            </span>
+
+          </div>
+
+          <div class="card-body">
+
+            ${
+              active
+                ? `
+                  <div class="scan">
+
+                    <div class="scan-top">
+
+                      <div>
+
+                        <div class="scan-title">
+                          ${esc(active.target)}
+                        </div>
+
+                        <div class="scan-meta">
+                          ${esc(active.scan_type)}
+                        </div>
+
+                      </div>
+
+                      ${statusBadge(active.status)}
+
+                    </div>
+
+                    <div
+                      class="progress"
+                      style="margin-top:11px"
+                    >
+                      <span
+                        style="width:${active.progress}%"
+                      ></span>
+                    </div>
+
+                    <div
+                      class="tiny"
+                      style="margin-top:7px"
+                    >
+                      ${esc(
+                        active.current_stage||
+                        'queued'
+                      )}
+                      ·
+                      ${active.progress}%
+                    </div>
+
+                    <div
+                      class="actions"
+                      style="margin-top:11px"
+                    >
+
+                      <button
+                        class="btn"
+                        onclick="openScan('${active.id}')"
+                      >
+                        Open Scan
+                      </button>
+
+                      ${
+                        active.status==='running'||
+                        active.status==='stopping'
+                          ? `
+                            <button
+                              class="btn danger"
+                              onclick="stopScan('${active.id}')"
+                            >
+                              Stop Scan
+                            </button>
+                          `
+                          : ''
+                      }
+
+                    </div>
+
+                  </div>
+                `
+                : `
+                  <div class="empty">
+                    No scan is running.
+                    Start a new reconnaissance run.
+                  </div>
+                `
+            }
+
+          </div>
+
+        </div>
+
+
+        <div class="card">
+
+          <div class="card-head">
+
+            <h3>
+              Recent Changes
+            </h3>
+
+            <button
+              class="btn"
+              onclick="openPage('changes')"
+            >
+              View
+            </button>
+
+          </div>
+
+          <div class="card-body">
+
+            ${
+              d.recent_changes?.length
+                ? `
+                  <div class="scan-list">
+
+                    ${d.recent_changes
+                      .slice(0,6)
+                      .map(c=>`
+                        <div class="scan">
+
+                          <div class="scan-top">
+
+                            <strong>
+                              ${esc(c.asset)}
+                            </strong>
+
+                            <span class="badge green">
+                              ${esc(c.type)}
+                            </span>
+
+                          </div>
+
+                          <div class="scan-meta">
+                            ${esc(c.target)}
+                            ·
+                            ${esc(c.current||'new')}
+                          </div>
+
+                        </div>
+                      `)
+                      .join('')}
+
+                  </div>
+                `
+                : `
+                  <div class="empty">
+                    No recorded changes yet.
+                  </div>
+                `
+            }
+
+          </div>
+
+        </div>
+
+      </div>
+
+
+      <div
+        class="card"
+        style="margin-top:16px"
+      >
+
+        <div class="card-head">
+
+          <h3>
+            Recent Scans
+          </h3>
+
+          <button
+            class="btn"
+            onclick="openPage('scans')"
+          >
+            All Scans
+          </button>
+
+        </div>
+
+        <div class="table-wrap">
+
+          <table class="table">
+
+            <thead>
+
+              <tr>
+                <th>Target</th>
+                <th>Type</th>
+                <th>Status</th>
+                <th>Progress</th>
+                <th></th>
+              </tr>
+
+            </thead>
+
+            <tbody>
+
+              ${
+                scans
+                  .slice(0,6)
+                  .map(s=>`
+                    <tr>
+
+                      <td class="mono">
+                        ${esc(s.target)}
+                      </td>
+
+                      <td>
+                        ${esc(s.scan_type)}
+                      </td>
+
+                      <td>
+                        ${statusDot(s.status)}
+                      </td>
+
+                      <td>
+                        ${s.progress}%
+                      </td>
+
+                      <td>
+
+                        <button
+                          class="btn"
+                          onclick="openScan('${s.id}')"
+                        >
+                          Open
+                        </button>
+
+                        ${
+                          terminalStatuses.has(s.status)
+                            ? `
+                              <button
+                                class="btn danger"
+                                onclick="deleteScan('${s.id}')"
+                              >
+                                Delete
+                              </button>
+                            `
+                            : ''
+                        }
+
+                      </td>
+
+                    </tr>
+                  `)
+                  .join('')
+              }
+
+            </tbody>
+
+          </table>
+
+        </div>
+
+      </div>
+    `;
+
+    syncHeader();
+
+    if(active){
+      startScanStream(active.id)
+    }
+
+  }catch(e){
+    el.innerHTML=`
+      <div class="empty">
+        ${esc(hideScanIds(e.message))}
+      </div>
+    `
+  }
+}
+
+
+/* =========================================================
+   Scans
+   ========================================================= */
+
+async function loadScans(){
+  const el=$('page-scans');
+
+  el.innerHTML=
+    '<div class="empty"><span class="spinner"></span> Loading scans…</div>';
+
+  try{
+    const scans=
+      await api('/api/scans?limit=200');
+
+    const active=
+      scans.find(
+        s=>[
+          'queued',
+          'running',
+          'stopping'
+        ].includes(s.status)
+      );
+
+    el.innerHTML=`
+      <div class="head">
+
+        <div>
+
+          <h2>
+            Scans
+          </h2>
+
+          <p>
+            Active scan, live progress and
+            complete scan history in one place.
+          </p>
+
+        </div>
+
+        <div class="actions">
+
+          <span
+            class="badge ${active?'cyan':'green'}"
+          >
+            ${active?'1 ACTIVE':'IDLE'}
+          </span>
+
+          <button
+            class="btn primary"
+            onclick="openModal()"
+            ${active?'disabled':''}
+          >
+            ＋ New Scan
+          </button>
+
+        </div>
+
+      </div>
+
+
+      <div
+        class="metric-grid"
+        style="margin-bottom:16px"
+      >
+
+        <div class="metric">
+          <strong>
+            ${
+              scans.filter(
+                s=>s.status==='running'
+              ).length
+            }
+          </strong>
+
+          <span>
+            Running
+          </span>
+        </div>
+
+        <div class="metric">
+          <strong>
+            ${
+              scans.filter(
+                s=>s.status==='stopping'
+              ).length
+            }
+          </strong>
+
+          <span>
+            Stopping
+          </span>
+        </div>
+
+        <div class="metric">
+          <strong>
+            ${
+              scans.filter(
+                s=>terminalStatuses.has(
+                  s.status
+                )
+              ).length
+            }
+          </strong>
+
+          <span>
+            Completed / Stopped
+          </span>
+        </div>
+
+        <div class="metric">
+          <strong>
+            1
+          </strong>
+
+          <span>
+            Max Concurrent
+          </span>
+        </div>
+
+      </div>
+
+
+      ${
+        active
+          ? `
+            <div
+              class="card"
+              style="margin-bottom:16px"
+            >
+
+              <div class="card-head">
+
+                <h3>
+                  Active Scan
+                </h3>
+
+                ${statusBadge(active.status)}
+
+              </div>
+
+              <div class="card-body">
+
+                <div class="scan-top">
+
+                  <div>
+
+                    <div class="scan-title mono">
+                      ${esc(active.target)}
+                    </div>
+
+                    <div class="scan-meta">
+                      ${esc(active.scan_type)}
+                    </div>
+
+                  </div>
+
+                  <div class="actions">
+
+                    <button
+                      class="btn"
+                      onclick="openScan('${active.id}')"
+                    >
+                      Open
+                    </button>
+
+                    ${
+                      active.status==='running'||
+                      active.status==='stopping'
+                        ? `
+                          <button
+                            class="btn danger"
+                            onclick="stopScan('${active.id}')"
+                          >
+                            Stop Scan
+                          </button>
+                        `
+                        : ''
+                    }
+
+                  </div>
+
+                </div>
+
+                <div
+                  class="progress"
+                  style="margin-top:12px"
+                >
+                  <span
+                    style="width:${active.progress}%"
+                  ></span>
+                </div>
+
+                <div
+                  class="tiny"
+                  style="margin-top:7px"
+                >
+                  ${esc(
+                    active.current_stage||
+                    'queued'
+                  )}
+                  ·
+                  ${active.progress}%
+                </div>
+
+              </div>
+
+            </div>
+          `
+          : ''
+      }
+
+
+      <div class="card">
+
+        <div class="card-head">
+
+          <h3>
+            Scan History
+          </h3>
+
+          <div class="tiny">
+            ${scans.length} runs
+          </div>
+
+        </div>
+
+        <div class="table-wrap">
+
+          <table class="table">
+
+            <thead>
+
+              <tr>
+                <th>Target</th>
+                <th>Type</th>
+                <th>Status</th>
+                <th>Progress</th>
+                <th>Created</th>
+                <th>Finished</th>
+                <th>Actions</th>
+              </tr>
+
+            </thead>
+
+            <tbody>
+
+              ${
+                scans
+                  .map(s=>`
+                    <tr>
+
+                      <td class="mono">
+                        ${esc(s.target)}
+                      </td>
+
+                      <td>
+                        ${esc(s.scan_type)}
+                      </td>
+
+                      <td>
+                        ${statusDot(s.status)}
+                      </td>
+
+                      <td>
+                        ${s.progress}%
+                      </td>
+
+                      <td class="muted">
+                        ${
+                          new Date(
+                            s.created_at
+                          ).toLocaleString()
+                        }
+                      </td>
+
+                      <td class="muted">
+                        ${
+                          s.finished_at
+                            ? new Date(
+                                s.finished_at
+                              ).toLocaleString()
+                            : '—'
+                        }
+                      </td>
+
+                      <td>
+
+                        <button
+                          class="btn"
+                          onclick="openScan('${s.id}')"
+                        >
+                          Open
+                        </button>
+
+                        ${
+                          terminalStatuses.has(s.status)
+                            ? `
+                              <button
+                                class="btn danger"
+                                onclick="deleteScan('${s.id}')"
+                              >
+                                Delete
+                              </button>
+                            `
+                            : ''
+                        }
+
+                      </td>
+
+                    </tr>
+                  `)
+                  .join('')
+                ||
+                `
+                  <tr>
+                    <td
+                      colspan="7"
+                      class="empty"
+                    >
+                      No scans yet.
+                    </td>
+                  </tr>
+                `
+              }
+
+            </tbody>
+
+          </table>
+
+        </div>
+
+      </div>
+    `;
+
+    syncHeader();
+
+    if(active){
+      startScanStream(active.id)
+    }
+
+  }catch(e){
+    el.innerHTML=`
+      <div class="empty">
+        ${esc(hideScanIds(e.message))}
+      </div>
+    `
+  }
+}
+
+
+/* =========================================================
+   Assets
+   ========================================================= */
+
+function assetTabs(){
+    return [
+      'subdomains',
+      'alive',
+      'ports',
+      'endpoints',
+      'secrets',
+      'findings'
+    ]
+  }
+
+async function getScanResource(
+  id,
+  resource,
+  page=1,
+  limit=100
+){
+  return api(
+    `/api/scans/${id}/${resource}?page=${page}&limit=${limit}`
+  )
+}
+function resourcePaginationMarkup(){
+
+  if(state.resourceTotal<=0){
+    return '';
+  }
+
+  const previousDisabled=
+    state.resourcePage<=1
+      ? 'disabled'
+      : '';
+
+  const nextDisabled=
+    state.resourcePage>=state.resourcePages
+      ? 'disabled'
+      : '';
+
+  const first=
+    ((state.resourcePage-1)*state.resourceLimit)+1;
+
+  const last=
+    Math.min(
+      state.resourcePage*state.resourceLimit,
+      state.resourceTotal
+    );
+
+  const sizeOptions=
+    [25,50,100,250,500]
+      .map(size=>`
+        <option
+          value="${size}"
+          ${size===state.resourceLimit?'selected':''}
+        >
+          ${size} / page
+        </option>
+      `)
+      .join('');
+
+  return `
+    <div
+      class="actions"
+      style="
+        justify-content:center;
+        align-items:center;
+        margin-top:14px;
+        gap:10px;
+        flex-wrap:wrap;
+      "
+    >
+
+      <button
+        class="btn"
+        ${previousDisabled}
+        onclick="changeResourcePage(1)"
+        title="First page"
+      >
+        « First
+      </button>
+
+      <button
+        class="btn"
+        ${previousDisabled}
+        onclick="changeResourcePage(${state.resourcePage-1})"
+      >
+        ← Previous
+      </button>
+
+      <span class="tiny">
+        ${first}–${last}
+        of
+        ${state.resourceTotal}
+        · Page
+        ${state.resourcePage}
+        /
+        ${state.resourcePages}
+      </span>
+
+      <button
+        class="btn"
+        ${nextDisabled}
+        onclick="changeResourcePage(${state.resourcePage+1})"
+      >
+        Next →
+      </button>
+
+      <button
+        class="btn"
+        ${nextDisabled}
+        onclick="changeResourcePage(${state.resourcePages})"
+        title="Last page"
+      >
+        Last »
+      </button>
+
+      <select
+        class="select"
+        style="width:auto;min-width:110px"
+        onchange="changeResourceLimit(Number(this.value))"
+        aria-label="Rows per page"
+      >
+        ${sizeOptions}
+      </select>
+
+    </div>
+  `;
+}
+
+
+async function changeResourcePage(page){
+
+  if(
+    page<1 ||
+    page>state.resourcePages
+  ){
+    return;
+  }
+
+  state.resourcePage=page;
+
+  if(state.page==='scan-detail'){
+    await renderScanAssetTab();
+    return;
+  }
+
+  if(state.page==='assets'){
+    await renderGlobalAssetTab(
+      state.scanId
+    );
+  }
+}
+
+
+async function changeResourceLimit(limit){
+
+  const nextLimit=Number(limit);
+
+  if(
+    !Number.isFinite(nextLimit) ||
+    ![25,50,100,250,500].includes(nextLimit)
+  ){
+    return;
+  }
+
+  state.resourceLimit=nextLimit;
+  state.resourcePage=1;
+
+  if(state.page==='scan-detail'){
+    await renderScanAssetTab();
+    return;
+  }
+
+  if(state.page==='assets'){
+    await renderGlobalAssetTab(
+      state.scanId
+    );
+  }
+}
+
+
+function exportLinks(scanId,res){
+  return `
+    <div class="actions">
+
+      <a
+        class="btn"
+        href="/api/scans/${scanId}/export/${res}.json"
+      >
+        JSON
+      </a>
+
+      <a
+        class="btn"
+        href="/api/scans/${scanId}/export/${res}.txt"
+      >
+        TXT
+      </a>
+
+    </div>
+  `
+}
+
+async function loadScanDetail(){
+  const el=$('page-scan-detail');
+
+  if(!state.scanId){
+    openPage('scans');
+    return
+  }
+
+  el.innerHTML=
+    '<div class="empty"><span class="spinner"></span> Loading scan…</div>';
+
+  try{
+    const d=
+      await api(
+        `/api/scans/${state.scanId}`
+      );
+
+    state.scan=d;
+
+    resetResourceTableState();
+
+    const stages=d.stages||[];
+
+    const active=
+      !terminalStatuses.has(
+        d.status
+      );
+
+    el.innerHTML=`
+      <div class="head">
+
+        <div>
+
+          <h2>
+            ${esc(d.target)}
+          </h2>
+
+          <p>
+            ${esc(d.scan_type)}
+            ·
+            ${d.links.length}
+            submitted link(s)
+          </p>
+
+        </div>
+
+        <div class="actions">
+
+          <span
+            class="badge ${active?'cyan':'green'}"
+          >
+            ${esc(
+              d.status
+                .replaceAll('_',' ')
+                .toUpperCase()
+            )}
+          </span>
+
+          ${
+            active
+              ? `
+                <button
+                  class="btn danger"
+                  onclick="stopScan('${d.id}')"
+                >
+                  ⛔ Stop Scan
+                </button>
+              `
+              : ''
+          }
+
+          ${
+  !active
+    ? `
+      <button
+        class="btn danger"
+        onclick="deleteScan('${d.id}')"
+      >
+        Delete Scan
+      </button>
+    `
+    : ''
+}
+
+          <button
+            class="btn"
+            onclick="openPage('scans')"
+          >
+            ← Scans
+          </button>
+
+        </div>
+
+      </div>
+
+
+      <div class="card">
+
+        <div class="card-body">
+
+          <div class="callout">
+
+            <strong>
+              Submitted links:
+            </strong>
+
+            ${d.links
+              .map(
+                x=>`
+                  <span
+                    class="mono"
+                    style="margin-right:10px"
+                  >
+                    ${esc(x)}
+                  </span>
+                `
+              )
+              .join('')}
+
+          </div>
+
+          <div
+            class="progress"
+            style="margin-top:15px"
+          >
+
+            <span
+              style="width:${d.progress}%"
+            ></span>
+
+          </div>
+
+          <div
+            class="tiny"
+            style="margin-top:7px"
+          >
+            ${esc(
+              d.current_stage||
+              'complete'
+            )}
+            ·
+            ${d.progress}%
+          </div>
+
+        </div>
+
+      </div>
+
+
+      <div
+        class="card"
+        style="margin-top:16px"
+      >
+
+        <div class="card-head">
+
+          <h3>
+            Pipeline
+          </h3>
+
+          <span class="tiny">
+            one scan at a time
+          </span>
+
+        </div>
+
+        <div class="card-body">
+
+          <div class="scan-list">
+
+            ${stages
+              .map(
+                s=>`
+                  <div class="scan">
+
+                    <div class="scan-top">
+
+                      <strong>
+                        ${esc(s.name)}
+                      </strong>
+
+                      ${statusBadge(s.status)}
+
+                    </div>
+
+                    <div
+                      class="tiny"
+                      style="margin-top:7px"
+                    >
+
+                      ${s.progress}%
+
+                      ${
+                        s.error
+                          ? `
+                            ·
+                            ${esc(
+                              hideScanIds(
+                                s.error
+                              )
+                            )}
+                          `
+                          : ''
+                      }
+
+                    </div>
+
+                  </div>
+                `
+              )
+              .join('')}
+
+          </div>
+
+        </div>
+
+      </div>
+
+
+      <div
+        class="tabs"
+        style="margin-top:16px"
+      >
+
+        ${assetTabs()
+          .map(
+            x=>`
+              <button
+                class="tab ${
+                  state.assetTab===x
+                    ? 'active'
+                    : ''
+                }"
+                onclick="selectAssetTab('${x}')"
+              >
+                ${x.replaceAll('_',' ')}
+              </button>
+            `
+          )
+          .join('')}
+
+      </div>
+
+
+      <div
+        id="assetDetailCard"
+        class="card"
+      ></div>
+    `;
+
+    await renderScanAssetTab();
+
+    if(active){
+      startScanStream(d.id)
+    }
+
+  }catch(e){
+    el.innerHTML=`
+      <div class="empty">
+        ${esc(hideScanIds(e.message))}
+      </div>
+    `
+  }
+}
+
+function syncAssetTabButtons(){
+  document
+    .querySelectorAll('button.tab')
+    .forEach(button=>{
+      const onclick =
+        button.getAttribute('onclick') || '';
+
+      let tab = null;
+
+      const scanMatch =
+        onclick.match(
+          /selectAssetTab\('([^']+)'\)/
+        );
+
+      const globalMatch =
+        onclick.match(
+          /selectAssetTabFromAssets\(\s*'([^']+)'/
+        );
+
+      if(scanMatch){
+        tab=scanMatch[1];
+      }else if(globalMatch){
+        tab=globalMatch[1];
+      }
+
+      if(tab){
+        button.classList.toggle(
+          'active',
+          tab===state.assetTab
+        );
+      }
+    });
+}
+
+async function selectAssetTab(tab){
+  state.assetTab=tab;
+  saveNavigationState();
+
+  resetResourceTableState();
+
+  syncAssetTabButtons();
+
+  await renderScanAssetTab()
+}
+
+let scanAssetRenderSeq=0;
+
+async function renderScanAssetTab(){
+  const host=$('assetDetailCard');
+
+  if(
+    !host||
+    !state.scanId
+  ){
+    return
+  }
+
+  host.innerHTML=
+    '<div class="empty"><span class="spinner"></span> Loading…</div>';
+
+  const res=state.assetTab;
+
+  try{
+    const data=
+      await getScanResource(
+        state.scanId,
+        res==='findings'
+          ? 'findings'
+          : res,
+        state.resourcePage,
+        state.resourceLimit
+      );
+
+    const rows=
+      data?.items||[];
+
+    state.resourcePage=
+      Number(data?.page)||1;
+
+    state.resourceLimit=
+      Number(data?.limit)||100;
+
+    state.resourceTotal=
+      Number(data?.total)||0;
+
+    state.resourcePages=
+      Number(data?.pages)||0;
+
+    const fields=
+      resourceFields(res);
+
+    host.innerHTML=`
+      <div class="card-head">
+
+        <h3>
+          ${
+            res==='subdomains'
+              ? 'Subdomains'
+              : res.replaceAll('_',' ')
+          }
+        </h3>
+
+        ${exportLinks(
+          state.scanId,
+          res
+        )}
+
+      </div>
+    `;
+
+    const tableHost=
+      document.createElement('div');
+
+    tableHost.id=
+      'scanResourceTable';
+
+    host.appendChild(tableHost);
+
+    const extraHeader=
+      (res==='subdomains'||res==='alive')
+        ? '<th>Action</th>'
+        : '';
+
+    const extraCell=
+      res==='subdomains'
+        ? row=>`
+            <td>
+
+              <button
+                class="btn"
+                onclick="openScanFfuf('${esc(row.fqdn||'')}')"
+              >
+                FFUF
+              </button>
+
+            </td>
+          `
+        : res==='alive'
+          ? row=>`
+            <td>
+
+              <button
+                class="btn"
+                onclick="openScanFfuf('${esc(row.url||'')}')"
+              >
+                FFUF
+              </button>
+
+            </td>
+          `
+        : '';
+
+    renderResourceTable(
+      tableHost,
+      res,
+      rows,
+      fields,
+      extraHeader,
+      extraCell
+    );
+
+    host.insertAdjacentHTML(
+      'beforeend',
+      resourcePaginationMarkup()
+    );
+
+  }catch(e){
+    host.innerHTML=`
+      <div class="empty">
+        ${esc(hideScanIds(e.message))}
+      </div>
+    `;
+  }
+}
+
+
+function openScanFfuf(target){
+  if(!state.scanId){
+    return
+  }
+
+  const value=String(target||'').trim();
+
+  if(!value){
+    return
+  }
+
+  state.ffufRunId=null;
+
+  try{
+    const parsed=
+      /^https?:\/\//i.test(value)
+        ? new URL(value)
+        : new URL(`https://${value}`);
+
+    state.ffufHost=parsed.hostname;
+    state.ffufTargetUrl=
+      `${parsed.origin}/FUZZ`;
+  }catch{
+    state.ffufHost=value;
+    state.ffufTargetUrl=
+      `https://${value}/FUZZ`;
+  }
+
+  saveNavigationState();
+
+  openPage('scan-ffuf')
+}
+
+
+/* =========================================================
+   FFUF
+   ========================================================= */
+
+async function renderFfufPage(){
+  const el=$('page-scan-ffuf');
+
+  /* FFUF UI styles are injected once so the structured result table does
+     not depend on an older external stylesheet. */
+  if(!document.getElementById('stacksurface-ffuf-ui-style')){
+    const style=document.createElement('style');
+    style.id='stacksurface-ffuf-ui-style';
+    style.textContent=`
+      #ffufOutput.ffuf-output{
+        background:#05090e;
+        border:1px solid #1e2a34;
+        border-radius:12px;
+        padding:14px;
+        color:#b6e6ff;
+        font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;
+      }
+      #ffufOutput .ffuf-summary{
+        display:flex;
+        gap:10px;
+        margin-bottom:12px;
+      }
+      #ffufOutput .ffuf-summary-item{
+        min-width:120px;
+        padding:10px 12px;
+        border:1px solid #1e2d3a;
+        border-radius:10px;
+        background:#0a1119;
+      }
+      #ffufOutput .ffuf-summary-item .tiny{
+        display:block;
+        margin-bottom:3px;
+      }
+      #ffufOutput .ffuf-summary-item strong{
+        display:block;
+        color:#fff;
+        font-size:18px;
+        line-height:1.1;
+      }
+      #ffufOutput .ffuf-table-wrap{
+        width:100%;
+        overflow-x:auto;
+        border:1px solid #172633;
+        border-radius:10px;
+      }
+      #ffufOutput .ffuf-table{
+        min-width:900px;
+        width:100%;
+        background:#071019;
+      }
+      #ffufOutput .ffuf-result-row{
+        display:grid;
+        grid-template-columns:88px minmax(360px,1fr) 100px 100px 100px 110px;
+        align-items:center;
+        min-height:42px;
+        border-top:1px solid #14222d;
+      }
+      #ffufOutput .ffuf-result-row:first-child{
+        border-top:0;
+      }
+      #ffufOutput .ffuf-header{
+        position:sticky;
+        top:0;
+        z-index:1;
+        min-height:38px;
+        background:#0c151f;
+        color:#7890a6;
+        font-size:10px;
+        font-weight:700;
+        letter-spacing:.06em;
+      }
+      #ffufOutput .ffuf-result-row:not(.ffuf-header):hover{
+        background:#0b1721;
+      }
+      #ffufOutput .ffuf-cell{
+        min-width:0;
+        padding:9px 11px;
+        overflow:hidden;
+        text-overflow:ellipsis;
+        white-space:nowrap;
+      }
+      #ffufOutput .ffuf-url-cell{
+        min-width:0;
+      }
+      #ffufOutput .ffuf-url-cell .mono{
+        display:block;
+        overflow:hidden;
+        text-overflow:ellipsis;
+        white-space:nowrap;
+      }
+      #ffufOutput .ffuf-status-code{
+        display:inline-flex;
+        min-width:48px;
+        justify-content:center;
+        padding:3px 7px;
+        border:1px solid #294051;
+        border-radius:6px;
+        color:#dcebf5;
+        background:#0b151e;
+      }
+      #ffufOutput .ffuf-status-code.status-2,
+      #ffufOutput .ffuf-status-code.status-200,
+      #ffufOutput .ffuf-status-code.status-201,
+      #ffufOutput .ffuf-status-code.status-204{
+        border-color:#24513f;
+        color:#8ff0c0;
+      }
+      #ffufOutput .ffuf-status-code.status-3,
+      #ffufOutput .ffuf-status-code.status-301,
+      #ffufOutput .ffuf-status-code.status-302,
+      #ffufOutput .ffuf-status-code.status-307,
+      #ffufOutput .ffuf-status-code.status-308{
+        border-color:#5c4d28;
+        color:#ffe39b;
+      }
+      #ffufOutput .ffuf-status-code.status-4,
+      #ffufOutput .ffuf-status-code.status-400,
+      #ffufOutput .ffuf-status-code.status-401,
+      #ffufOutput .ffuf-status-code.status-403,
+      #ffufOutput .ffuf-status-code.status-404{
+        border-color:#5a2e38;
+        color:#ff9ca8;
+      }
+      #ffufOutput .ffuf-empty-row{
+        padding:24px;
+        text-align:center;
+        color:#687d90;
+        font-family:ui-sans-serif,system-ui,sans-serif;
+      }
+      #ffufOutput .ffuf-raw-panel{
+        margin-top:12px;
+        border-top:1px solid #172633;
+        padding-top:10px;
+      }
+      #ffufOutput .ffuf-raw-panel summary{
+        cursor:pointer;
+        color:#9db1c3;
+        user-select:none;
+      }
+      #ffufOutput .ffuf-raw-output{
+        margin-top:9px;
+        max-height:220px;
+        overflow:auto;
+        padding:10px;
+        border:1px solid #172633;
+        border-radius:8px;
+        background:#03070b;
+        color:#8198aa;
+      }
+      #ffufOutput .ffuf-raw-line{
+        white-space:pre-wrap;
+        overflow-wrap:anywhere;
+        padding:2px 0;
+      }
+      @media(max-width:760px){
+        #ffufOutput .ffuf-summary{flex-wrap:wrap}
+        #ffufOutput .ffuf-summary-item{min-width:110px}
+      }
+    `;
+    document.head.appendChild(style);
+  }
+
+  if(!state.scanId){
+    openPage('scans');
+    return
+  }
+
+  try{
+    const scan=
+      state.scan||
+      await api(
+        `/api/scans/${state.scanId}`
+      );
+
+    const words=
+      await api('/api/wordlists');
+
+    
+    // FFUF targets must come only from hosts that have a live HTTP service.
+    // Fetch all alive pages, extract hostnames, and deduplicate them.
+    const aliveItems = [];
+    let alivePage = 1;
+
+    while(true){
+      const aliveData =
+        await getScanResource(
+          state.scanId,
+          'alive',
+          alivePage,
+          500
+        );
+
+      const pageItems =
+        aliveData?.items || [];
+
+      aliveItems.push(
+        ...pageItems
+      );
+
+      const totalPages =
+        Number(aliveData?.pages || 1);
+
+      if(
+        alivePage >= totalPages ||
+        pageItems.length === 0
+      ){
+        break;
+      }
+
+      alivePage += 1;
+    }
+
+    const seenLiveHosts = new Set();
+
+    const subdomains =
+      aliveItems
+        .map(item => {
+          try{
+            return new URL(
+              item.url
+            ).hostname.toLowerCase();
+          }catch(_){
+            return null;
+          }
+        })
+        .filter(host => {
+          if(!host || seenLiveHosts.has(host)){
+            return false;
+          }
+
+          seenLiveHosts.add(host);
+          return true;
+        })
+        .map(fqdn => ({
+          fqdn
+        }));
+
+
+    let ffufRun=null;
+
+    if(state.ffufRunId){
+      try{
+        ffufRun=await api(
+          `/api/ffuf-runs/${state.ffufRunId}`
+        );
+      }catch{
+        state.ffufRunId=null;
+        saveNavigationState();
+      }
+    }
+
+    el.innerHTML=`
+      <div class="head">
+
+        <div>
+
+          <h2>
+            FFUF ·
+            <span class="mono">
+              ${esc(
+                state.ffufHost||
+                'Select a subdomain'
+              )}
+            </span>
+          </h2>
+
+          <p>
+            Scan-scoped fuzzing.
+            Configure exactly what to send
+            and inspect actual FFUF output.
+          </p>
+
+        </div>
+
+        <div class="actions">
+
+          <button
+            class="btn"
+            onclick="openPage('scan-detail')"
+          >
+            ← Back to Scan
+          </button>
+
+          <span class="badge cyan">
+            SCAN SCOPED
+          </span>
+
+        </div>
+
+      </div>
+
+
+      <div class="grid2">
+
+        <div class="card">
+
+          <div class="card-head">
+            <h3>
+              Target & Wordlist
+            </h3>
+          </div>
+
+          <div class="card-body">
+
+            <div class="form-grid">
+
+              <div class="field full">
+
+                <label>
+                  Subdomain
+                </label>
+
+                <select
+                  id="ffufSubdomain"
+                  class="select"
+                >
+
+                  ${
+                    subdomains
+                      .map(
+                        x=>`
+                          <option
+                            value="${esc(x.fqdn)}"
+                            ${
+                              x.fqdn===state.ffufHost
+                                ? 'selected'
+                                : ''
+                            }
+                          >
+                            ${esc(x.fqdn)}
+                          </option>
+                        `
+                      )
+                      .join('')
+                  }
+
+                </select>
+
+              </div>
+
+
+              <div class="field">
+
+                <label>
+                  Mode
+                </label>
+
+                <select
+                  id="ffufMode"
+                  class="select"
+                >
+
+                  <option value="path">
+                    Path / Directory
+                  </option>
+
+                  <option value="parameter">
+                    Parameter
+                  </option>
+
+                  <option value="header">
+                    Header
+                  </option>
+
+                  <option value="body">
+                    Body
+                  </option>
+
+                </select>
+
+              </div>
+
+
+              <div class="field">
+
+                <label>
+                  Method
+                </label>
+
+                <select
+                  id="ffufMethod"
+                  class="select"
+                >
+
+                  <option>
+                    GET
+                  </option>
+
+                  <option>
+                    POST
+                  </option>
+
+                  <option>
+                    PUT
+                  </option>
+
+                  <option>
+                    PATCH
+                  </option>
+
+                  <option>
+                    DELETE
+                  </option>
+
+                </select>
+
+              </div>
+
+
+              <div class="field full">
+
+                <label>
+                  Exact URL / insertion point
+                </label>
+
+                <input
+                  id="ffufUrl"
+                  class="input"
+                  value="${esc(
+                    state.ffufTargetUrl||
+                    `https://${state.ffufHost||'example.com'}/FUZZ`
+                  )}"
+                >
+
+              </div>
+
+
+              <div class="field">
+
+                <label>
+                  SecLists / Custom wordlist
+                </label>
+
+                <select
+                  id="ffufWordlist"
+                  class="select"
+                >
+
+                  ${words
+                    .map(
+                      w=>`
+                        <option
+                          value="${esc(w.id)}"
+                        >
+                          ${esc(w.name)}
+                        </option>
+                      `
+                    )
+                    .join('')}
+
+                </select>
+
+              </div>
+
+
+              <div class="field">
+
+                <label>
+                  Threads
+                </label>
+
+                <input
+                  id="ffufThreads"
+                  class="input"
+                  type="number"
+                  min="1"
+                  max="100"
+                  value="20"
+                >
+
+              </div>
+
+
+              <div class="field">
+
+                <label>
+                  Request rate
+                </label>
+
+                <input
+                  id="ffufRate"
+                  class="input"
+                  type="number"
+                  min="0"
+                  value="0"
+                >
+
+              </div>
+
+
+              <div class="field">
+
+                <label>
+                  Extensions
+                </label>
+
+                <input
+                  id="ffufExtensions"
+                  class="input"
+                  placeholder=".php,.json,.bak"
+                >
+
+              </div>
+
+            </div>
+
+
+            <div
+              class="actions"
+              style="margin-top:13px"
+            >
+
+              <input
+                id="customWordlist"
+                type="file"
+                accept=".txt"
+                style="display:none"
+              >
+
+              <button
+                class="btn"
+                onclick="$('customWordlist').click()"
+              >
+                Upload custom wordlist
+              </button>
+
+              <button
+                id="uploadWordBtn"
+                class="btn"
+                style="display:none"
+                onclick="uploadCustomWordlist()"
+              >
+                Save custom wordlist
+              </button>
+
+            </div>
+
+          </div>
+
+        </div>
+
+
+        <div class="card">
+
+          <div class="card-head">
+            <h3>
+              Match / Filter
+            </h3>
+          </div>
+
+          <div class="card-body">
+
+            <div class="form-grid">
+
+              <div class="field">
+
+                <label>
+                  Match status
+                </label>
+
+                <input
+                  id="mStatus"
+                  class="input"
+                  placeholder="200,204,301"
+                >
+
+              </div>
+
+
+              <div class="field">
+
+                <label>
+                  Filter status
+                </label>
+
+                <input
+                  id="fStatus"
+                  class="input"
+                  placeholder="404"
+                >
+
+              </div>
+
+
+              <div class="field">
+
+                <label>
+                  Match size
+                </label>
+
+                <input
+                  id="mSize"
+                  class="input"
+                >
+
+              </div>
+
+
+              <div class="field">
+
+                <label>
+                  Filter size
+                </label>
+
+                <input
+                  id="fSize"
+                  class="input"
+                >
+
+              </div>
+
+
+              <div class="field">
+
+                <label>
+                  Match words
+                </label>
+
+                <input
+                  id="mWords"
+                  class="input"
+                >
+
+              </div>
+
+
+              <div class="field">
+
+                <label>
+                  Filter words
+                </label>
+
+                <input
+                  id="fWords"
+                  class="input"
+                >
+
+              </div>
+
+
+              <div class="field">
+
+                <label>
+                  Match lines
+                </label>
+
+                <input
+                  id="mLines"
+                  class="input"
+                >
+
+              </div>
+
+
+              <div class="field">
+
+                <label>
+                  Filter lines
+                </label>
+
+                <input
+                  id="fLines"
+                  class="input"
+                >
+
+              </div>
+
+
+              <div class="field full">
+
+                <label>
+                  Regex filter
+                </label>
+
+                <input
+                  id="ffufRegex"
+                  class="input"
+                >
+
+              </div>
+
+
+              <div class="field full">
+
+                <label>
+                  Headers (one per line: Name: value)
+                </label>
+
+                <textarea
+                  id="ffufHeaders"
+                  class="textarea"
+                  style="min-height:70px"
+                ></textarea>
+
+              </div>
+
+
+              <div class="field full">
+
+                <label>
+                  Body
+                </label>
+
+                <textarea
+                  id="ffufBody"
+                  class="textarea"
+                  style="min-height:70px"
+                  placeholder='{"name":"FUZZ"}'
+                ></textarea>
+
+              </div>
+
+            </div>
+
+
+            <button
+              class="btn primary"
+              style="
+                width:100%;
+                margin-top:15px
+              "
+              onclick="startFfuf()"
+            >
+              ▶ Run FFUF
+            </button>
+
+          </div>
+
+        </div>
+
+      </div>
+
+
+      <div
+        class="card"
+        style="margin-top:16px"
+      >
+
+        <div class="card-head">
+
+          <h3>
+            Actual Output
+          </h3>
+
+          <div class="actions">
+
+            <span
+              id="ffufStatus"
+              class="badge"
+            >
+              ${esc(
+                ffufRun?.status
+                  ? ffufRun.status.toUpperCase()
+                  : 'READY'
+              )}
+            </span>
+
+            ${
+              ffufRun &&
+              ['queued','running','stopping'].includes(
+                ffufRun.status
+              )
+                ? `
+                  <button
+                    id="stopFfufBtn"
+                    class="btn danger"
+                    onclick="stopFfuf()"
+                  >
+                    Stop FFUF
+                  </button>
+                `
+                : ''
+            }
+
+            <button
+              class="btn"
+              onclick="clearFfufOutput()"
+            >
+              Clear
+            </button>
+
+          </div>
+
+        </div>
+
+        <div class="card-body">
+
+          <div
+            id="ffufOutput"
+            class="ffuf-output"
+          >
+
+            <div class="ffuf-summary" aria-live="polite">
+
+              <div class="ffuf-summary-item">
+                <span class="tiny">RESULTS</span>
+                <strong id="ffufResultCount">0</strong>
+              </div>
+
+              <div class="ffuf-summary-item">
+                <span class="tiny">RAW LINES</span>
+                <strong id="ffufRawCount">0</strong>
+              </div>
+
+            </div>
+
+            <div class="ffuf-table-wrap">
+
+              <div class="ffuf-table" role="table" aria-label="FFUF results">
+
+                <div class="ffuf-result-row ffuf-header" role="row">
+                  <div class="ffuf-cell" role="columnheader">STATUS</div>
+                  <div class="ffuf-cell ffuf-url-cell" role="columnheader">URL</div>
+                  <div class="ffuf-cell" role="columnheader">SIZE</div>
+                  <div class="ffuf-cell" role="columnheader">WORDS</div>
+                  <div class="ffuf-cell" role="columnheader">LINES</div>
+                  <div class="ffuf-cell" role="columnheader">TIME</div>
+                </div>
+
+                <div id="ffufEmptyRow" class="ffuf-empty-row">
+                  No FFUF matches yet.
+                </div>
+
+              </div>
+
+            </div>
+
+            <details class="ffuf-raw-panel">
+              <summary>Raw FFUF Output</summary>
+              <div id="ffufRawOutput" class="ffuf-raw-output"></div>
+            </details>
+
+          </div>
+
+        </div>
+
+      </div>
+    `;
+
+    const subdomainSelect=$('ffufSubdomain');
+
+    if(subdomainSelect){
+      subdomainSelect.onchange=()=>{
+        syncFfufTargetFromSubdomain();
+      };
+    }
+
+    const file=$('customWordlist');
+
+    file.onchange=()=>{
+      $('uploadWordBtn').style.display=
+        file.files.length
+          ? 'inline-flex'
+          : 'none'
+    };
+
+    if(state.ffufRunId){
+      attachFfufStream(
+        state.ffufRunId
+      )
+    }
+
+  }catch(e){
+    el.innerHTML=`
+      <div class="empty">
+        ${esc(hideScanIds(e.message))}
+      </div>
+    `
+  }
+}
+
+async function uploadCustomWordlist(){
+  const f=
+    $('customWordlist')
+      .files[0];
+
+  if(!f){
+    return
+  }
+
+  const form=new FormData();
+
+  form.append(
+    'file',
+    f
+  );
+
+  try{
+    const r=
+      await fetch(
+        '/api/wordlists/custom',
+        {
+          method:'POST',
+          body:form
+        }
+      );
+
+    if(!r.ok){
+      throw new Error(
+        await r.text()
+      );
+    }
+
+    toast(
+      'Custom wordlist stored in PostgreSQL.'
+    );
+
+    renderFfufPage();
+
+  }catch(e){
+    toast(e.message)
+  }
+}
+
+function parseHeaders(text){
+  const out={};
+
+  for(
+    const line of text.split(/\n/)
+  ){
+    const i=line.indexOf(':');
+
+    if(i>0){
+      out[
+        line.slice(0,i).trim()
+      ]=
+        line.slice(i+1).trim();
+    }
+  }
+
+  return out;
+}
+
+function resetFfufOutputView(){
+  const output=$('ffufOutput');
+  if(!output){
+    return;
+  }
+
+  output.querySelectorAll('.ffuf-result-row:not(.ffuf-header)').forEach(
+    row=>row.remove()
+  );
+
+  const raw=$('ffufRawOutput');
+  if(raw){
+    raw.innerHTML='';
+  }
+
+  const empty=$('ffufEmptyRow');
+  if(empty){
+    empty.style.display='block';
+  }
+
+  const resultCount=$('ffufResultCount');
+  const rawCount=$('ffufRawCount');
+  if(resultCount){
+    resultCount.textContent='0';
+  }
+  if(rawCount){
+    rawCount.textContent='0';
+  }
+}
+
+function validateFfufTarget(){
+  const selected=String($('ffufSubdomain')?.value||'').trim().toLowerCase().replace(/\.$/,'');
+  const raw=String($('ffufUrl')?.value||'').trim();
+
+  if(!selected){
+    throw new Error('Select a scan-scoped subdomain before running FFUF.');
+  }
+  if(!raw){
+    throw new Error('Enter a FFUF target URL.');
+  }
+
+  let parsed;
+  try{
+    parsed=new URL(raw);
+  }catch{
+    throw new Error('FFUF target must be a valid http:// or https:// URL.');
+  }
+
+  const host=String(parsed.hostname||'').toLowerCase().replace(/\.$/,'');
+  if(host!==selected){
+    throw new Error(
+      `FFUF target must stay within the selected scan-scoped host: ${selected}`
+    );
+  }
+
+  if(!/^https?:$/.test(parsed.protocol)){
+    throw new Error('FFUF target must use HTTP or HTTPS.');
+  }
+
+  if(!raw.includes('FUZZ')){
+    throw new Error('FFUF target URL must contain the FUZZ insertion point.');
+  }
+
+  return parsed;
+}
+
+function syncFfufTargetFromSubdomain(){
+  const selected=String($('ffufSubdomain')?.value||'').trim();
+  const url=$('ffufUrl');
+  if(!selected||!url){
+    return;
+  }
+
+  try{
+    const parsed=new URL(url.value.trim());
+    const host=String(parsed.hostname||'').toLowerCase();
+    if(host!==selected.toLowerCase()){
+      url.value=`https://${selected}/FUZZ`;
+    }
+  }catch{
+    url.value=`https://${selected}/FUZZ`;
+  }
+
+  state.ffufHost=selected;
+  state.ffufTargetUrl=url.value;
+  saveNavigationState();
+}
+
+function syncFfufStopButton(status){
+  const statusEl=$('ffufStatus');
+
+  if(statusEl){
+    statusEl.textContent=
+      String(status||'READY').toUpperCase();
+  }
+
+  const controls=
+    statusEl
+      ? statusEl.parentElement
+      : null;
+
+  if(!controls){
+    return;
+  }
+
+  let button=$('stopFfufBtn');
+
+  const activeStatuses=[
+    'queued',
+    'running',
+    'stopping'
+  ];
+
+  const normalized=
+    String(status||'').toLowerCase();
+
+  const active=
+    activeStatuses.includes(normalized);
+
+  if(!active){
+    if(button){
+      button.remove();
+    }
+    return;
+  }
+
+  if(!button){
+    button=document.createElement('button');
+    button.id='stopFfufBtn';
+    button.className='btn danger';
+    button.onclick=stopFfuf;
+
+    const clearButton=
+      controls.querySelector(
+        'button[onclick="clearFfufOutput()"]'
+      );
+
+    if(clearButton){
+      controls.insertBefore(
+        button,
+        clearButton
+      );
+    }else{
+      controls.appendChild(button);
+    }
+  }
+
+  button.disabled=
+    normalized==='stopping';
+
+  button.textContent=
+    normalized==='stopping'
+      ? 'Stopping…'
+      : 'Stop FFUF';
+}
+
+
+async function startFfuf(){
+  try{
+    const parsed=validateFfufTarget();
+    const url=parsed.toString();
+
+    const payload={
+      scan_id:state.scanId,
+      subdomain:$('ffufSubdomain').value,
+      mode:$('ffufMode').value,
+      url,
+      method:$('ffufMethod').value,
+      headers:parseHeaders($('ffufHeaders').value),
+      body:$('ffufBody').value||null,
+      wordlist_id:$('ffufWordlist').value,
+      match_status:$('mStatus').value||null,
+      filter_status:$('fStatus').value||null,
+      match_size:$('mSize').value||null,
+      filter_size:$('fSize').value||null,
+      match_words:$('mWords').value||null,
+      filter_words:$('fWords').value||null,
+      match_lines:$('mLines').value||null,
+      filter_lines:$('fLines').value||null,
+      regex:$('ffufRegex').value||null,
+      extensions:$('ffufExtensions').value||null,
+      threads:Number($('ffufThreads').value||20),
+      rate:Number($('ffufRate').value||0),
+      recursion:false
+    };
+
+    const run=await api('/api/ffuf-runs',{
+      method:'POST',
+      body:JSON.stringify(payload)
+    });
+
+    state.ffufRunId=run.id;
+    state.ffufTargetUrl=url;
+    saveNavigationState();
+
+    resetFfufOutputView();
+
+    syncFfufStopButton('queued');
+
+    appendFfufRaw('[StackSurface] FFUF queued.');
+    updateFfufCounters();
+    attachFfufStream(run.id);
+
+    toast('FFUF started.');
+  }catch(e){
+    toast(e.message);
+  }
+}
+
+async function stopFfuf(){
+  const runId=state.ffufRunId;
+
+  if(!runId){
+    return;
+  }
+
+  if(!confirm('Stop this FFUF job?')){
+    return;
+  }
+
+  const btn=$('stopFfufBtn');
+
+  if(btn){
+    btn.disabled=true;
+    btn.textContent='Stopping…';
+  }
+
+  try{
+    const run=await api(
+      `/api/ffuf-runs/${runId}/stop`,
+      {
+        method:'POST'
+      }
+    );
+
+    syncFfufStopButton(
+      run.status||'stopping'
+    );
+
+    toast(
+      run.status==='cancelled'
+        ? 'FFUF stopped.'
+        : 'FFUF stop requested.'
+    );
+
+  }catch(e){
+    syncFfufStopButton('running');
+
+    toast(e.message);
+  }
+}
+
+function clearFfufOutput(){
+  resetFfufOutputView();
+}
+
+function renderFfufResult(result){
+  const output=document.querySelector('#ffufOutput .ffuf-table');
+  if(!output){
+    return;
+  }
+
+  const status=Number(result.status||0);
+  const url=String(result.url||'');
+  const length=result.length ?? '';
+  const words=result.words ?? '';
+  const lines=result.lines ?? '';
+  const duration=result.duration ?? '';
+
+  const empty=$('ffufEmptyRow');
+  if(empty){
+    empty.style.display='none';
+  }
+
+  const row=document.createElement('div');
+  row.className='ffuf-result-row';
+  row.setAttribute('role','row');
+
+  const statusCell=document.createElement('div');
+  statusCell.className='ffuf-cell ffuf-status-cell';
+  statusCell.setAttribute('role','cell');
+  const badge=document.createElement('span');
+  badge.className=`ffuf-status-code status-${status}`;
+  badge.textContent=String(status);
+  statusCell.appendChild(badge);
+
+  const urlCell=document.createElement('div');
+  urlCell.className='ffuf-cell ffuf-url-cell';
+  urlCell.setAttribute('role','cell');
+  urlCell.title=url;
+  const urlText=document.createElement('span');
+  urlText.className='mono';
+  urlText.textContent=url;
+  urlCell.appendChild(urlText);
+
+  const cells=[
+    statusCell,
+    urlCell,
+    [length,'cell'],
+    [words,'cell'],
+    [lines,'cell'],
+    [duration,'cell ffuf-duration']
+  ];
+
+  row.appendChild(cells[0]);
+  row.appendChild(cells[1]);
+  for(let i=2;i<cells.length;i++){
+    const cell=document.createElement('div');
+    cell.className=`ffuf-${cells[i][1]}`.replace('ffuf-cell','ffuf-cell');
+    cell.className=cells[i][1].startsWith('cell')
+      ? `ffuf-cell${cells[i][1].includes('ffuf-duration')?' ffuf-duration':''}`
+      : 'ffuf-cell';
+    cell.setAttribute('role','cell');
+    cell.textContent=String(cells[i][0]);
+    row.appendChild(cell);
+  }
+
+  output.appendChild(row);
+}
+
+function appendFfufRaw(line){
+  const raw=$('ffufRawOutput');
+  if(!raw){
+    return;
+  }
+
+  const item=document.createElement('div');
+  item.className='ffuf-raw-line';
+  item.textContent=String(line);
+  raw.appendChild(item);
+  raw.scrollTop=raw.scrollHeight;
+}
+
+function updateFfufCounters(){
+  const output=document.querySelector('#ffufOutput .ffuf-table');
+  if(!output){
+    return;
+  }
+
+  const rows=output.querySelectorAll('.ffuf-result-row:not(.ffuf-header)').length;
+  const raw=$('ffufRawOutput');
+  const rawLines=raw ? raw.querySelectorAll('.ffuf-raw-line').length : 0;
+
+  const resultCount=$('ffufResultCount');
+  const rawCount=$('ffufRawCount');
+
+  if(resultCount){
+    resultCount.textContent=String(rows);
+  }
+  if(rawCount){
+    rawCount.textContent=String(rawLines);
+  }
+}
+
+function attachFfufStream(runId){
+  stopFfufStream();
+
+  const es=new EventSource(`/api/ffuf-runs/${runId}/stream`);
+  state.ffufEventSource=es;
+
+  es.onmessage=e=>{
+    try{
+      const d=JSON.parse(e.data);
+      const line=String(d.line||'');
+
+      let result=null;
+      try{
+        result=JSON.parse(line);
+      }catch(_){
+        result=null;
+      }
+
+      if(result && typeof result==='object' && result.url){
+        renderFfufResult(result);
+        updateFfufCounters();
+        syncFfufStopButton('running');
+        return;
+      }
+
+      appendFfufRaw(line);
+      updateFfufCounters();
+
+      syncFfufStopButton('running');
+    }catch(err){
+      console.error('FFUF stream parse error:',err);
+    }
+  };
+
+  es.addEventListener('done',e=>{
+    try{
+      const d=JSON.parse(e.data);
+
+      syncFfufStopButton(
+        d.status||'completed'
+      );
+
+      if(d.error){
+        appendFfufRaw(`[ERROR] ${d.error}`);
+        updateFfufCounters();
+      }
+    }catch(err){
+      console.error('FFUF done event error:',err);
+    }
+
+    es.close();
+    state.ffufEventSource=null;
+    updateFfufCounters();
+  });
+
+  es.onerror=()=>{
+    if($('ffufStatus')){
+      $('ffufStatus').textContent='DISCONNECTED';
+    }
+  };
+}
+
+/* =========================================================
+   Scan streaming
+   ========================================================= */
+
+function startScanStream(id){
+  stopScanStream();
+
+  const es=
+    new EventSource(
+      `/api/scans/${id}/stream`
+    );
+
+  state.scanEventSource=es;
+
+  es.onmessage=
+    async e=>{
+      const d=
+        JSON.parse(e.data);
+
+      if(
+        state.page==='scan-detail'||
+        state.page==='scans'||
+        state.page==='dashboard'
+      ){
+        if(state.scanId===id){
+          state.scan=d
+        }
+      }
+
+      if(
+        terminalStatuses.has(
+          d.status
+        )
+      ){
+        es.close();
+
+        state.scanEventSource=null;
+
+        if(
+          state.page==='scan-detail'
+        ){
+          await loadScanDetail();
+        }else if(
+          state.page==='scans'
+        ){
+          await loadScans();
+        }else if(
+          state.page==='dashboard'
+        ){
+          await loadDashboard();
+        }else{
+          syncHeader()
+        }
+      }
+    };
+
+  es.onerror=()=>{
+    if(
+      !terminalStatuses.has(
+        state.scan?.status||''
+      )
+    ){
+      setTimeout(
+        ()=>{
+          if(
+            [
+              'scans',
+              'dashboard',
+              'scan-detail'
+            ].includes(
+              state.page
+            )
+          ){
+            startScanStream(id)
+          }
+        },
+        1500
+      )
+    }
+  }
+}
+
+
+/* =========================================================
+   Global Assets
+   ========================================================= */
+
+async function loadAssets(){
+  const scans=
+    await api('/api/scans?limit=30');
+
+  const selected=
+    state.scanId||
+    scans[0]?.id;
+
+  if(!selected){
+    $('page-assets').innerHTML=
+      '<div class="empty">No scans yet.</div>';
+
+    return
+  }
+
+  state.scanId=selected;
+  saveNavigationState();
+
+  resetResourceTableState();
+
+  const d=
+    await api(
+      `/api/scans/${selected}`
+    );
+
+  $('page-assets').innerHTML=`
+    <div class="head">
+
+      <div>
+
+        <h2>
+          Assets
+        </h2>
+
+        <p>
+          Asset columns are persisted per scan.
+          FFUF is accessible only from a scan.
+        </p>
+
+      </div>
+
+      <span class="badge">
+        ${esc(d.target)}
+      </span>
+
+    </div>
+
+
+    <div class="card">
+
+      <div class="card-head">
+
+        <h3>
+          Target Group
+        </h3>
+
+        <span class="tiny">
+          ${d.links.length}
+          submitted link(s)
+        </span>
+
+      </div>
+
+      <div class="card-body">
+
+        <div class="callout mono">
+          ${d.links
+            .map(esc)
+            .join(' · ')}
+        </div>
+
+        <div
+          class="metric-grid"
+          style="margin-top:14px"
+        >
+
+          ${Object.entries(d.counts)
+            .map(
+              ([k,v])=>`
+                <div class="metric">
+
+                  <strong>
+                    ${v}
+                  </strong>
+
+                  <span>
+                    ${k.replaceAll('_',' ')}
+                  </span>
+
+                </div>
+              `
+            )
+            .join('')}
+
+        </div>
+
+      </div>
+
+    </div>
+
+
+    <div
+      style="margin-top:16px"
+      class="actions"
+    >
+
+      <select
+        class="select"
+        style="max-width:260px"
+        onchange="
+          state.scanId=this.value;
+          loadAssets()
+        "
+      >
+
+        ${scans
+          .map(
+            s=>`
+              <option
+                value="${s.id}"
+                ${
+                  s.id===selected
+                    ? 'selected'
+                    : ''
+                }
+              >
+                ${esc(s.target)}
+                ·
+                ${esc(s.scan_type)}
+              </option>
+            `
+          )
+          .join('')}
+
+      </select>
+
+
+      <button
+        class="btn"
+        onclick="openScan('${selected}')"
+      >
+        Open Scan
+      </button>
+
+    </div>
+
+
+    <div
+      class="tabs"
+      style="margin-top:16px"
+    >
+
+      ${assetTabs()
+        .map(
+          x=>`
+            <button
+              class="tab ${
+                state.assetTab===x
+                  ? 'active'
+                  : ''
+              }"
+              onclick="
+                selectAssetTabFromAssets(
+                  '${x}',
+                  '${selected}'
+                )
+              "
+            >
+              ${x.replaceAll('_',' ')}
+            </button>
+          `
+        )
+        .join('')}
+
+    </div>
+
+
+    <div
+      id="assetGlobalCard"
+      class="card"
+    ></div>
+  `;
+
+  await renderGlobalAssetTab(
+    selected
+  )
+}
+
+async function selectAssetTabFromAssets(
+  tab,
+  id
+){
+  state.assetTab=tab;
+  state.scanId=id;
+  saveNavigationState();
+
+  resetResourceTableState();
+
+  syncAssetTabButtons();
+
+  await renderGlobalAssetTab(id)
+}
+
+let globalAssetRenderSeq=0;
+
+async function renderGlobalAssetTab(id){
+  const host=$('assetGlobalCard');
+
+  if(!host){
+    return
+  }
+
+  try{
+    const res=
+      state.assetTab;
+
+    const data=
+      await getScanResource(
+        id,
+        res,
+        state.resourcePage,
+        state.resourceLimit
+      );
+
+    const rows=
+      data?.items||[];
+
+    state.resourcePage=
+      Number(data?.page)||1;
+
+    state.resourceLimit=
+      Number(data?.limit)||100;
+
+    state.resourceTotal=
+      Number(data?.total)||0;
+
+    state.resourcePages=
+      Number(data?.pages)||0;
+
+    const fields=
+      resourceFields(res);
+
+    host.innerHTML=`
+      <div class="card-head">
+
+        <h3>
+          ${res.replaceAll('_',' ')}
+        </h3>
+
+        ${exportLinks(
+          id,
+          res
+        )}
+
+      </div>
+    `;
+
+    const tableHost=
+      document.createElement('div');
+
+    tableHost.id=
+      'assetGlobalTable';
+
+    host.appendChild(
+      tableHost
+    );
+
+    const extraHeader=
+      (res==='subdomains'||res==='alive')
+        ? '<th>FFUF</th>'
+        : '';
+
+    const extraCell=
+      res==='subdomains'
+        ? row=>`
+            <td>
+
+              <button
+                class="btn"
+                onclick="openScanFfuf('${esc(row.fqdn||'')}')"
+              >
+                FFUF
+              </button>
+
+            </td>
+          `
+        : res==='alive'
+          ? row=>`
+            <td>
+
+              <button
+                class="btn"
+                onclick="openScanFfuf('${esc(row.url||'')}')"
+              >
+                FFUF
+              </button>
+
+            </td>
+          `
+        : '';
+
+    renderResourceTable(
+      tableHost,
+      res,
+      rows,
+      fields,
+      extraHeader,
+      extraCell
+    );
+
+    host.insertAdjacentHTML(
+      'beforeend',
+      resourcePaginationMarkup()
+    );
+
+  }catch(e){
+    host.innerHTML=`
+      <div class="empty">
+        ${esc(hideScanIds(e.message))}
+      </div>
+    `;
+  }
+}
+
+
+/* =========================================================
+   Changes
+   ========================================================= */
+
+async function loadChanges(){
+  const el=$('page-changes');
+
+  const scans=
+    await api('/api/scans?limit=30');
+
+  if(!scans.length){
+    el.innerHTML=
+      '<div class="empty">No scans yet.</div>';
+
+    return
+  }
+
+  const selected=
+    state.scanId&&
+    scans.find(
+      s=>s.id===state.scanId
+    )
+      ? state.scanId
+      : scans[0].id;
+
+  state.scanId=selected;
+  saveNavigationState();
+
+  const d=
+    await api(
+      `/api/scans/${selected}/changes`
+    );
+
+  el.innerHTML=`
+    <div class="head">
+
+      <div>
+
+        <h2>
+          Changes
+        </h2>
+
+        <p>
+          Compare the selected scan with
+          the previous completed scan for this target.
+        </p>
+
+      </div>
+
+      <span class="badge green">
+        ${d.length}
+        CHANGES
+      </span>
+
+    </div>
+
+
+    <div
+      class="actions"
+      style="margin-bottom:13px"
+    >
+
+      <select
+        class="select"
+        style="max-width:320px"
+        onchange="
+          state.scanId=this.value;
+          loadChanges()
+        "
+      >
+
+        ${scans
+          .map(
+            s=>`
+              <option
+                value="${s.id}"
+                ${
+                  s.id===selected
+                    ? 'selected'
+                    : ''
+                }
+              >
+                ${esc(s.target)}
+                ·
+                ${esc(s.scan_type)}
+              </option>
+            `
+          )
+          .join('')}
+
+      </select>
+
+      ${exportLinks(
+        selected,
+        'changes'
+      )}
+
+    </div>
+
+
+    <div class="card">
+
+      <div class="table-wrap">
+
+        <table class="table">
+
+          <thead>
+
+            <tr>
+              <th>Type</th>
+              <th>Asset</th>
+              <th>Previous</th>
+              <th>Current</th>
+            </tr>
+
+          </thead>
+
+          <tbody>
+
+            ${
+              d.length
+                ? d.map(
+                    x=>`
+                      <tr>
+
+                        <td>
+                          <span class="badge green">
+                            ${esc(
+                              x.change_type
+                            )}
+                          </span>
+                        </td>
+
+                        <td class="mono">
+                          ${esc(x.asset)}
+                        </td>
+
+                        <td>
+                          ${esc(
+                            x.previous_value||
+                            '—'
+                          )}
+                        </td>
+
+                        <td>
+                          ${esc(
+                            x.current_value||
+                            '—'
+                          )}
+                        </td>
+
+                      </tr>
+                    `
+                  ).join('')
+
+                : `
+                  <tr>
+
+                    <td
+                      colspan="4"
+                      class="empty"
+                    >
+                      No changes recorded
+                      for this scan.
+                    </td>
+
+                  </tr>
+                `
+            }
+
+          </tbody>
+
+        </table>
+
+      </div>
+
+    </div>
+  `
+}
+
+
+/* =========================================================
+   Findings
+   ========================================================= */
+
+async function loadFindings(){
+  const el=$('page-findings');
+
+  const scans=
+    await api('/api/scans?limit=30');
+
+  if(!scans.length){
+    el.innerHTML=
+      '<div class="empty">No scans yet.</div>';
+
+    return
+  }
+
+  const selected=
+    state.scanId&&
+    scans.find(
+      s=>s.id===state.scanId
+    )
+      ? state.scanId
+      : scans[0].id;
+
+  state.scanId=selected;
+  saveNavigationState();
+
+  const rows=
+    await api(
+      `/api/scans/${selected}/findings`
+    );
+
+  el.innerHTML=`
+    <div class="head">
+
+      <div>
+
+        <h2>
+          Findings
+        </h2>
+
+        <p>
+          Finding names are kept simple;
+          evidence remains in the tool result data.
+        </p>
+
+      </div>
+
+      <span class="badge red">
+        ${rows.length}
+        FINDINGS
+      </span>
+
+    </div>
+
+
+    <div
+      class="actions"
+      style="margin-bottom:13px"
+    >
+
+      <select
+        class="select"
+        style="max-width:320px"
+        onchange="
+          state.scanId=this.value;
+          loadFindings()
+        "
+      >
+
+        ${scans
+          .map(
+            s=>`
+              <option
+                value="${s.id}"
+                ${
+                  s.id===selected
+                    ? 'selected'
+                    : ''
+                }
+              >
+                ${esc(s.target)}
+                ·
+                ${esc(s.scan_type)}
+              </option>
+            `
+          )
+          .join('')}
+
+      </select>
+
+      ${exportLinks(
+        selected,
+        'findings'
+      )}
+
+    </div>
+
+
+    <div class="card">
+
+      <div class="table-wrap">
+
+        <table class="table">
+
+          <thead>
+
+            <tr>
+              <th>Name</th>
+              <th>Tool</th>
+              <th>Severity</th>
+              <th>Target</th>
+              <th>Status</th>
+            </tr>
+
+          </thead>
+
+          <tbody>
+
+            ${
+              rows.length
+                ? rows.map(
+                    x=>`
+                      <tr>
+
+                        <td>
+                          ${esc(x.name)}
+                        </td>
+
+                        <td>
+                          ${esc(x.tool)}
+                        </td>
+
+                        <td>
+                          ${esc(
+                            x.severity||
+                            '—'
+                          )}
+                        </td>
+
+                        <td class="mono">
+                          ${esc(
+                            x.target||
+                            '—'
+                          )}
+                        </td>
+
+                        <td>
+                          ${esc(
+                            x.status||
+                            'open'
+                          )}
+                        </td>
+
+                      </tr>
+                    `
+                  ).join('')
+
+                : `
+                  <tr>
+
+                    <td
+                      colspan="5"
+                      class="empty"
+                    >
+                      No findings recorded.
+                    </td>
+
+                  </tr>
+                `
+            }
+
+          </tbody>
+
+        </table>
+
+      </div>
+
+    </div>
+  `
+}
+
+
+/* =========================================================
+   Navigation / Startup
+   ========================================================= */
+
+document
+  .querySelectorAll('#nav button')
+  .forEach(
+    b=>
+      b.addEventListener(
+        'click',
+        ()=>openPage(
+          b.dataset.page
+        )
+      )
+  );
+
+async function performGlobalSearch(query){
+  const q = String(query || '').trim();
+
+  if(!q){
+    return;
+  }
+
+  const input = $('globalSearch');
+
+  try{
+    if(input){
+      input.disabled = true;
+    }
+
+    const results = await api(
+      `/api/search?q=${encodeURIComponent(q)}&limit=100`
+    );
+
+    if(!results || !Array.isArray(results.results)){
+      throw new Error('Invalid search response');
+    }
+
+    const rows = results.results;
+
+    if(!rows.length){
+      openPage('scans');
+
+      const page = $('page-scans');
+
+      if(page){
+        page.innerHTML = `
+          <div class="empty">
+            No results found for
+            <strong>${escapeHtml(q)}</strong>
+          </div>
+        `;
+      }
+
+      return;
+    }
+
+    openPage('scans');
+
+    const page = $('page-scans');
+
+    if(!page){
+      return;
+    }
+
+    page.innerHTML = `
+      <div class="card">
+        <div class="card-head">
+          <div>
+            <h2>Global Search</h2>
+            <div class="muted">
+              ${rows.length} result${rows.length === 1 ? '' : 's'}
+              for "${escapeHtml(q)}"
+            </div>
+          </div>
+        </div>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>TYPE</th>
+                <th>NAME</th>
+                <th>DETAIL</th>
+                <th>SCAN</th>
+              </tr>
+            </thead>
+
+            <tbody>
+              ${rows.map((row, index)=>`
+                <tr
+                  role="button"
+                  tabindex="0"
+                  class="global-search-result"
+                  data-search-index="${index}"
+                  style="cursor:pointer"
+                >
+                  <td>
+                    ${escapeHtml(row.type || '')}
+                  </td>
+
+                  <td>
+                    ${escapeHtml(row.name || row.value || '')}
+                  </td>
+
+                  <td>
+                    ${escapeHtml(
+                      row.detail ||
+                      row.url ||
+                      row.fqdn ||
+                      row.ip ||
+                      ''
+                    )}
+                  </td>
+
+                  <td>
+                    ${escapeHtml(
+                      row.scan_name ||
+                      row.scan_id ||
+                      ''
+                    )}
+                  </td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    `;
+
+    document
+      .querySelectorAll('.global-search-result')
+      .forEach(el=>{
+        const index = Number(el.dataset.searchIndex);
+        const row = rows[index];
+
+        const activate = ()=>{
+          if(row && row.scan_id){
+            state.scanId = row.scan_id;
+            state.page = 'scan-detail';
+            saveNavigationState();
+            openPage('scan-detail');
+          }
+        };
+
+        el.addEventListener('click', activate);
+
+        el.addEventListener('keydown', e=>{
+          if(
+            e.key === 'Enter' ||
+            e.key === ' '
+          ){
+            e.preventDefault();
+            activate();
+          }
+        });
+      });
+
+  }catch(err){
+    console.error('Global search failed:', err);
+
+    openPage('scans');
+
+    const page = $('page-scans');
+
+    if(page){
+      page.innerHTML = `
+        <div class="empty">
+          Global search failed:
+          ${escapeHtml(err.message || String(err))}
+        </div>
+      `;
+    }
+
+  }finally{
+    if(input){
+      input.disabled = false;
+    }
+  }
+}
+
+$('globalSearch').addEventListener(
+  'keydown',
+  e=>{
+    if(e.key === 'Enter'){
+      performGlobalSearch(e.target.value);
+    }
+  }
+);
+const advancedToolsToggle = $('advancedToolsToggle');
+const advancedToolsSection = advancedToolsToggle
+  ? advancedToolsToggle.closest('.nav-section')
+  : null;
+
+if(advancedToolsToggle && advancedToolsSection){
+  advancedToolsToggle.addEventListener(
+    'click',
+    ()=>{
+      advancedToolsSection.classList.toggle('collapsed');
+    }
+  );
+}
+profileSelect('full');
+
+refreshHealth();
+
+restoreNavigationState();
+
+openPage(
+  state.page||'dashboard'
+);
+
+setInterval(
+  refreshHealth,
+  10000
+);
+
+setInterval(
+  syncHeader,
+  5000
+);
+
+
+
+
+
+
+
+

@@ -784,56 +784,6 @@ def global_search(q: str = Query(..., min_length=1, max_length=200), limit: int 
 # ---------------------------------------------------------------------------
 # Scan resources
 # ---------------------------------------------------------------------------
-@app.get("/api/scans/{scan_id}/nmap-runs")
-def list_nmap_runs(scan_id: str):
-    from .models import NmapRun
-
-    with SessionLocal() as db:
-
-        scan = db.get(
-            Scan,
-            scan_id,
-        )
-
-        if not scan:
-            raise HTTPException(
-                404,
-                "Scan not found",
-            )
-
-        runs = db.scalars(
-            select(NmapRun)
-            .where(
-                NmapRun.scan_id == scan_id
-            )
-            .order_by(
-                NmapRun.created_at.desc()
-            )
-            .limit(100)
-        ).all()
-
-        return [
-            {
-                "id": x.id,
-                "scan_id": x.scan_id,
-                "target": x.target,
-                "config": x.config,
-                "command": x.command,
-                "status": x.status,
-                "output": x.output,
-                "results": x.results or [],
-                "exit_code": x.exit_code,
-                "error": x.error,
-                "created_at": x.created_at,
-                "started_at": x.started_at,
-                "finished_at": x.finished_at,
-            }
-            for x in runs
-        ]
-
-
-
-
 @app.get("/api/scans/{scan_id}/{resource}")
 def resource_list(
     scan_id: str,
@@ -1583,6 +1533,54 @@ def get_nmap_run(run_id: str):
         }
 
 
+@app.get("/api/scans/{scan_id}/nmap-runs")
+def list_nmap_runs(scan_id: str):
+    from .models import NmapRun
+
+    with SessionLocal() as db:
+
+        scan = db.get(
+            Scan,
+            scan_id,
+        )
+
+        if not scan:
+            raise HTTPException(
+                404,
+                "Scan not found",
+            )
+
+        runs = db.scalars(
+            select(NmapRun)
+            .where(
+                NmapRun.scan_id == scan_id
+            )
+            .order_by(
+                NmapRun.created_at.desc()
+            )
+            .limit(100)
+        ).all()
+
+        return [
+            {
+                "id": x.id,
+                "scan_id": x.scan_id,
+                "target": x.target,
+                "config": x.config,
+                "command": x.command,
+                "status": x.status,
+                "output": x.output,
+                "results": x.results or [],
+                "exit_code": x.exit_code,
+                "error": x.error,
+                "created_at": x.created_at,
+                "started_at": x.started_at,
+                "finished_at": x.finished_at,
+            }
+            for x in runs
+        ]
+
+
 @app.post("/api/nmap-runs/{run_id}/stop")
 def stop_nmap_run(run_id: str):
     from .models import NmapRun
@@ -1630,5 +1628,4 @@ def stop_nmap_run(run_id: str):
             "id": run.id,
             "status": run.status,
         }
-
 

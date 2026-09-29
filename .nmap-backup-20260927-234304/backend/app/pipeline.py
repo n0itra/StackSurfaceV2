@@ -1,0 +1,1733 @@
+﻿from __future__ import annotations
+
+import asyncio
+import json
+import os
+import re
+import signal
+import tempfile
+from collections import defaultdict
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import urlparse
+
+import requests
+from sqlalchemy import select, delete
+from sqlalchemy.orm import Session
+
+from .config import settings
+from .db import SessionLocal
+from .models import (Scan, ScanStage, ToolRun, Subdomain, WebService, OpenPort, Endpoint,
+                     Directory, Secret, Finding, Change, FFUFRuns, FFUFEvent, Wordlist,
+                     InfrastructureIP)
+from .utils import clean_host_lines, in_scope, mask_secret
+from .repository import previous_completed_scan
+
+
+FULL_STAGES = [
+    "discovery", "alterx", "dnsx", "httpx", "cdn", "shodan", "web_discovery",
+    "technologies_waf", "endpoint_dedupe", "nuclei_update", "nuclei", "js_analysis", "changes"
+]
+PROFILE_STAGES = {
+    "full": FULL_STAGES,
+    "discovery": ["discovery", "alterx", "dnsx", "httpx", "changes"],
+    "web": ["seed_existing", "web_discovery", "technologies_waf", "endpoint_dedupe", "js_analysis", "changes"],
+    "vuln": ["seed_existing", "nuclei_update", "nuclei", "js_analysis", "changes"],
+}
+
+TOOL_BINARIES = ["subfinder", "findomain", "assetfinder", "alterx", "dnsx", "httpx", "cdncheck", "gau", "katana", "wafw00f", "nuclei", "jsluice", "trufflehog", "ffuf"]
+
+
+def utcnow():
+    return datetime.now(timezone.utc)
+
+
+class CommandResult:
+    def __init__(self, code: int, stdout: str, stderr: str):
+        self.code = code
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+class ScanCancelled(Exception):
+    """Raised when the active scan receives a stop request."""
+
+
+async def _cancel_requested(scan_id: str) -> bool:
+    return await check_cancel(scan_id)
+
+
+def _terminate_process_group(proc, force: bool = False) -> None:
+    if proc.returncode is not None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGKILL if force else signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+
+
+async def _watch_for_cancel(scan_id: str, proc) -> bool:
+    while proc.returncode is None:
+        if await _cancel_requested(scan_id):
+            _terminate_process_group(proc, force=False)
+            await asyncio.sleep(2)
+            if proc.returncode is None:
+                _terminate_process_group(proc, force=True)
+            return True
+        await asyncio.sleep(0.5)
+    return False
+
+
+async def run_command(db: Session, scan_id: str, tool: str, stage: str, args: list[str], input_text: str | None = None, timeout: int | None = None) -> CommandResult:
+    """Run one tool with isolated DB logging and immediate stop support."""
+    if await _cancel_requested(scan_id):
+        raise ScanCancelled()
+
+    tool_db = SessionLocal()
+    tool_run = ToolRun(scan_id=scan_id, tool=tool, stage=stage, status="running")
+    tool_db.add(tool_run)
+    tool_db.commit()
+
+    try:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                tool, *args,
+                stdin=asyncio.subprocess.PIPE if input_text is not None else None,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+            )
+        except FileNotFoundError as exc:
+            tool_run.status = "missing"
+            tool_run.exit_code = 127
+            tool_run.stderr = str(exc)
+            tool_run.finished_at = utcnow()
+            tool_db.commit()
+            return CommandResult(127, "", str(exc))
+
+        communicate_task = asyncio.create_task(
+            proc.communicate(input_text.encode() if input_text is not None else None)
+        )
+        cancel_task = asyncio.create_task(_watch_for_cancel(scan_id, proc))
+
+        try:
+            done, _ = await asyncio.wait(
+                {communicate_task, cancel_task},
+                timeout=timeout or settings.command_timeout_seconds,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        except Exception:
+            done = set()
+
+        cancelled = False
+        timed_out = not done
+
+        if timed_out:
+            _terminate_process_group(proc, force=False)
+            await asyncio.sleep(2)
+            if proc.returncode is None:
+                _terminate_process_group(proc, force=True)
+            out_b, err_b = await communicate_task
+            tool_run.status = "timeout"
+            tool_run.exit_code = -1
+            tool_run.stdout = out_b.decode(errors="replace")[-20000:]
+            tool_run.stderr = (err_b.decode(errors="replace") + "\nTIMEOUT")[-20000:]
+            tool_run.finished_at = utcnow()
+            tool_db.commit()
+            cancel_task.cancel()
+            return CommandResult(-1, out_b.decode(errors="replace"), err_b.decode(errors="replace"))
+
+        if cancel_task in done and cancel_task.result():
+            cancelled = True
+
+        if communicate_task not in done:
+            out_b, err_b = await communicate_task
+        else:
+            out_b, err_b = communicate_task.result()
+
+        if cancel_task not in done:
+            cancel_task.cancel()
+
+        stdout = out_b.decode(errors="replace")
+        stderr = err_b.decode(errors="replace")
+        tool_run.status = "cancelled" if cancelled else ("completed" if proc.returncode == 0 else "failed")
+        tool_run.exit_code = -15 if cancelled else proc.returncode
+        tool_run.stdout = stdout[-20000:]
+        tool_run.stderr = stderr[-20000:]
+        tool_run.finished_at = utcnow()
+        tool_db.commit()
+
+        if cancelled:
+            raise ScanCancelled()
+
+        return CommandResult(proc.returncode or 0, stdout, stderr)
+    finally:
+        tool_db.close()
+
+
+async def update_scan(db: Session, scan: Scan, stage: str | None = None, progress: int | None = None, status: str | None = None, error: str | None = None):
+    scan.current_stage = stage if stage is not None else scan.current_stage
+    if progress is not None:
+        scan.progress = max(0, min(100, progress))
+    if status:
+        scan.status = status
+    if error is not None:
+        scan.error = error
+    db.commit()
+
+
+async def stage_begin(db: Session, scan: Scan, stage_name: str, position: int, total: int):
+    row = db.scalar(select(ScanStage).where(ScanStage.scan_id == scan.id, ScanStage.name == stage_name))
+    if not row:
+        row = ScanStage(scan_id=scan.id, name=stage_name, position=position)
+        db.add(row)
+    row.status = "running"
+    row.progress = 0
+    row.started_at = utcnow()
+    scan.current_stage = stage_name
+    scan.progress = int(((position - 1) / total) * 100)
+    db.commit()
+    return row
+
+
+async def stage_end(db: Session, scan: Scan, row: ScanStage, ok: bool = True, warning: str | None = None):
+    row.status = "completed" if ok else "completed_with_warning"
+    row.progress = 100
+    row.finished_at = utcnow()
+    row.error = warning
+    db.commit()
+
+
+async def check_cancel(scan_id: str) -> bool:
+    with SessionLocal() as db:
+        scan = db.get(Scan, scan_id)
+        return bool(scan and scan.cancel_requested)
+
+
+def parse_json_lines(text: str) -> list[dict]:
+    values = []
+    for line in text.splitlines():
+        try:
+            obj = json.loads(line)
+            if isinstance(obj, dict):
+                values.append(obj)
+        except json.JSONDecodeError:
+            continue
+    return values
+
+
+def extract_ip(obj: dict) -> str | None:
+    """Extract only an actual IP field; never fall back to a hostname."""
+    ip = obj.get("ip")
+
+    if isinstance(ip, list):
+        return str(ip[0]) if ip else None
+
+    if ip:
+        return str(ip)
+
+    return None
+
+
+def status_ok(status: int | None) -> bool:
+    return status in {200, 401, 403, 404}
+
+
+async def stage_discovery(db: Session, scan: Scan):
+    root = scan.target.canonical
+    results: dict[str, str] = {}
+
+    commands = [
+        ("subfinder", ["-d", root, "-silent"]),
+        ("findomain", ["-t", root, "-q"]),
+        ("assetfinder", ["--subs-only", root]),
+    ]
+
+    async def one(tool: str, args: list[str]):
+        res = await run_command(db, scan.id, tool, "discovery", args)
+        results[tool] = res.stdout
+
+    await asyncio.gather(*(one(t, a) for t, a in commands))
+
+    # crt.sh remains an independent passive source.
+    try:
+        response = await asyncio.to_thread(requests.get, f"https://crt.sh/?q=%25.{root}&output=json", timeout=30)
+        names = []
+        if response.ok:
+            for item in response.json():
+                names.extend(str(item.get("name_value", "")).splitlines())
+        results["crt.sh"] = "\n".join(names)
+    except Exception as exc:
+        results["crt.sh"] = ""
+        tool_run = ToolRun(scan_id=scan.id, tool="crt.sh", stage="discovery", status="failed", exit_code=1, stderr=str(exc), finished_at=utcnow())
+        db.add(tool_run)
+        db.commit()
+
+    merged: dict[str, set[str]] = defaultdict(set)
+    for source, text in results.items():
+        for host in clean_host_lines(text, root):
+            merged[host].add(source)
+
+    existing = {r.fqdn: r for r in db.scalars(select(Subdomain).where(Subdomain.scan_id == scan.id)).all()}
+    for fqdn, sources in merged.items():
+        row = existing.get(fqdn)
+        if not row:
+            row = Subdomain(scan_id=scan.id, fqdn=fqdn, sources=sorted(sources))
+            db.add(row)
+        else:
+            row.sources = sorted(set((row.sources or []) + list(sources)))
+    db.commit()
+    return sorted(merged)
+
+
+async def stage_alterx(db: Session, scan: Scan):
+    root_subdomains = [s.fqdn for s in db.scalars(select(Subdomain).where(Subdomain.scan_id == scan.id)).all()]
+    if not root_subdomains:
+        return []
+    with tempfile.NamedTemporaryFile("w", delete=False) as tmp:
+        tmp.write("\n".join(root_subdomains) + "\n")
+        path = tmp.name
+    try:
+        res = await run_command(db, scan.id, "alterx", "alterx", ["-l", path, "-silent", "-limit", str(settings.alterx_limit)])
+    finally:
+        os.unlink(path)
+    candidates = clean_host_lines(res.stdout, scan.target.canonical)
+    existing = {s.fqdn for s in db.scalars(select(Subdomain).where(Subdomain.scan_id == scan.id)).all()}
+    for fqdn in candidates:
+        if fqdn not in existing:
+            db.add(Subdomain(scan_id=scan.id, fqdn=fqdn, sources=["alterx"]))
+    db.commit()
+    return candidates
+
+
+async def stage_dnsx(db: Session, scan: Scan):
+    subdomains = [s.fqdn for s in db.scalars(select(Subdomain).where(Subdomain.scan_id == scan.id)).all()]
+    if not subdomains:
+        raise RuntimeError("No subdomains available for DNS resolution")
+    with tempfile.NamedTemporaryFile("w", delete=False) as tmp:
+        tmp.write("\n".join(subdomains) + "\n")
+        path = tmp.name
+    try:
+        res = await run_command(db, scan.id, "dnsx", "dnsx", ["-l", path, "-a", "-resp", "-json", "-silent"])
+    finally:
+        os.unlink(path)
+
+    objects = parse_json_lines(res.stdout)
+    ip_hosts: dict[str, set[str]] = defaultdict(set)
+    for obj in objects:
+        host = (obj.get("host") or obj.get("name") or "").lower()
+        ip = extract_ip(obj)
+        if host and ip:
+            ip_hosts[ip].add(host)
+
+    for ip, hosts in ip_hosts.items():
+        row = db.scalar(select(InfrastructureIP).where(InfrastructureIP.scan_id == scan.id, InfrastructureIP.ip == ip))
+        if not row:
+            db.add(InfrastructureIP(scan_id=scan.id, ip=ip, hostnames=sorted(hosts)))
+        else:
+            row.hostnames = sorted(set((row.hostnames or []) + list(hosts)))
+    db.commit()
+    return objects
+
+
+async def stage_httpx(db: Session, scan: Scan):
+    subdomains = [s.fqdn for s in db.scalars(select(Subdomain).where(Subdomain.scan_id == scan.id)).all()]
+    with tempfile.NamedTemporaryFile("w", delete=False) as tmp:
+        tmp.write("\n".join(subdomains) + "\n")
+        path = tmp.name
+    try:
+        res = await run_command(
+            db, scan.id, "httpx", "httpx",
+            ["-l", path, "-json", "-silent", "-status-code", "-title", "-tech-detect", "-ip", "-cdn", "-mc", "200,401,403,404"],
+        )
+    finally:
+        os.unlink(path)
+
+    raw_objects = parse_json_lines(res.stdout)
+    for obj in raw_objects:
+        status = obj.get("status_code") or obj.get("status-code")
+        try:
+            status = int(status) if status is not None else None
+        except (ValueError, TypeError):
+            status = None
+        if not status_ok(status):
+            continue
+        url = obj.get("url") or obj.get("input")
+        if not url:
+            continue
+        host = (urlparse(url).hostname or "").lower()
+        sub = db.scalar(select(Subdomain).where(Subdomain.scan_id == scan.id, Subdomain.fqdn == host))
+        tech = obj.get("tech") or obj.get("technologies") or []
+        if isinstance(tech, str):
+            tech = [tech]
+        row = db.scalar(select(WebService).where(WebService.scan_id == scan.id, WebService.url == url))
+        if not row:
+            row = WebService(scan_id=scan.id, subdomain_id=sub.id if sub else None, url=url, status_code=status, title=obj.get("title"), ip=extract_ip(obj), technologies=tech, cdn=obj.get("cdn"), raw=obj)
+            db.add(row)
+        else:
+            row.status_code = status
+            row.title = obj.get("title")
+            row.ip = extract_ip(obj)
+            row.technologies = tech
+            row.cdn = obj.get("cdn")
+            row.raw = obj
+    db.commit()
+
+
+async def stage_cdn(db: Session, scan: Scan):
+    rows = db.scalars(select(InfrastructureIP).where(InfrastructureIP.scan_id == scan.id)).all()
+    ips = sorted({r.ip for r in rows if r.ip})
+    if not ips:
+        return set()
+
+    sem = asyncio.Semaphore(8)
+
+    async def inspect_ip(ip: str):
+        async with sem:
+            res = await run_command(db, scan.id, "cdncheck", "cdn", ["-i", ip, "-j", "-nc", "-resp"], timeout=120)
+            return ip, res
+
+    results = await asyncio.gather(*(inspect_ip(ip) for ip in ips))
+    cdn_ips: set[str] = set()
+    waf_map: dict[str, str] = {}
+    cdn_map: dict[str, str] = {}
+
+    for ip, res in results:
+        objects = parse_json_lines(res.stdout)
+        text_out = res.stdout.strip()
+        for obj in objects:
+            provider = obj.get("provider") or obj.get("name") or obj.get("technology") or obj.get("cdn")
+            if obj.get("cdn") or obj.get("is_cdn") or obj.get("type") == "cdn":
+                cdn_ips.add(ip)
+                if provider:
+                    cdn_map[ip] = str(provider)[:120]
+            if obj.get("waf") or obj.get("is_waf") or obj.get("type") == "waf":
+                waf_map[ip] = str(provider or obj.get("waf"))[:120]
+        low = text_out.lower()
+        if any(name in low for name in ("cloudflare", "cloudfront", "fastly", "akamai", "imperva", "sucuri")):
+            cdn_ips.add(ip)
+            cdn_map.setdefault(ip, text_out[:120])
+
+    for row in rows:
+        if row.ip in cdn_ips:
+            row.cdn = True
+            row.cdn_name = cdn_map.get(row.ip)
+        if row.ip in waf_map:
+            row.waf_name = waf_map[row.ip]
+
+    # Propagate infrastructure classification to any live web service sharing the IP.
+    for ws in db.scalars(select(WebService).where(WebService.scan_id == scan.id)).all():
+        infra = next((r for r in rows if r.ip == ws.ip), None)
+        if infra:
+            ws.cdn = infra.cdn
+            ws.cdn_name = infra.cdn_name
+            ws.waf_name = infra.waf_name
+    db.commit()
+    return cdn_ips
+
+
+async def stage_shodan(db: Session, scan: Scan):
+    if not settings.shodan_api_key:
+        tool_run = ToolRun(scan_id=scan.id, tool="shodan", stage="shodan", status="skipped", exit_code=0, stderr="SHODAN_API_KEY not configured", finished_at=utcnow())
+        db.add(tool_run)
+        db.commit()
+        return
+    ips = sorted({r.ip for r in db.scalars(select(InfrastructureIP).where(InfrastructureIP.scan_id == scan.id, InfrastructureIP.cdn.is_(False))).all() if r.ip})
+    for ip in ips:
+        try:
+            data = await asyncio.to_thread(requests.get, f"https://api.shodan.io/shodan/host/{ip}", params={"key": settings.shodan_api_key}, timeout=30)
+            if not data.ok:
+                continue
+            payload = data.json()
+            for item in payload.get("data", []):
+                port = item.get("port")
+                if port is None:
+                    continue
+                service = item.get("product") or item.get("_shodan", {}).get("module")
+                version = item.get("version")
+                existing = db.scalar(select(OpenPort).where(OpenPort.scan_id == scan.id, OpenPort.ip == ip, OpenPort.port == int(port), OpenPort.protocol == (item.get("transport") or "tcp")))
+                if not existing:
+                    db.add(OpenPort(scan_id=scan.id, ip=ip, port=int(port), protocol=item.get("transport") or "tcp", service=service, version=version, raw=item))
+            db.commit()
+        except Exception:
+            continue
+
+
+async def stage_seed_existing(db: Session, scan: Scan):
+    previous = previous_completed_scan(db, scan)
+    if not previous:
+        raise RuntimeError("This scan profile requires a previous completed scan for the target")
+    # Copy the previous scan's web/subdomain/endpoints into the new scan as a snapshot.
+    old_subs = db.scalars(select(Subdomain).where(Subdomain.scan_id == previous.id)).all()
+    sub_map = {}
+    for old in old_subs:
+        new = Subdomain(scan_id=scan.id, fqdn=old.fqdn, sources=list(old.sources or []), is_new=False)
+        db.add(new); db.flush(); sub_map[old.id] = new.id
+    for old in db.scalars(select(WebService).where(WebService.scan_id == previous.id)).all():
+        db.add(WebService(scan_id=scan.id, subdomain_id=sub_map.get(old.subdomain_id), url=old.url, status_code=old.status_code, title=old.title, ip=old.ip, technologies=list(old.technologies or []), cdn=old.cdn, cdn_name=old.cdn_name, waf_name=old.waf_name, response_time_ms=old.response_time_ms, raw=old.raw or {}))
+    for old in db.scalars(select(Endpoint).where(Endpoint.scan_id == previous.id)).all():
+        existing = db.scalar(select(Endpoint).where(Endpoint.scan_id == scan.id, Endpoint.url == old.url))
+        if not existing:
+            db.add(Endpoint(scan_id=scan.id, url=old.url, source=old.source, status_code=old.status_code, method=old.method, kind=old.kind, raw=old.raw or {}))
+    db.commit()
+
+
+async def stage_gau_katana(db: Session, scan: Scan):
+    target = scan.target.canonical
+    http_urls = [w.url for w in db.scalars(select(WebService).where(WebService.scan_id == scan.id, WebService.status_code.in_([200,401,403,404]))).all()]
+    gau_task = run_command(db, scan.id, "gau", "web_discovery", ["--subs", target])
+    with tempfile.NamedTemporaryFile("w", delete=False) as tmp:
+        tmp.write("\n".join(http_urls) + "\n")
+        input_path = tmp.name
+    try:
+        katana_task = run_command(db, scan.id, "katana", "web_discovery", ["-list", input_path, "-silent"])
+        gau_res, katana_res = await asyncio.gather(gau_task, katana_task)
+    finally:
+        os.unlink(input_path)
+
+    seen = set()
+    for source, text in (("gau", gau_res.stdout), ("katana", katana_res.stdout)):
+        for line in text.splitlines():
+            url = line.strip()
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            parsed = urlparse(url)
+            kind = "endpoint" if parsed.path not in {"", "/"} else "root"
+            db.add(Endpoint(scan_id=scan.id, url=url, source=source, kind=kind))
+    db.commit()
+
+
+ANSI_ESCAPE_RE = re.compile(
+    r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])"
+)
+
+
+def clean_tool_output(text: str) -> str:
+    return ANSI_ESCAPE_RE.sub("", text or "")
+
+
+def parse_wafw00f_output(text: str) -> str | None:
+    clean = clean_tool_output(text)
+
+    for raw_line in clean.splitlines():
+        line = raw_line.strip()
+
+        if not line:
+            continue
+
+        lower = line.lower()
+
+        # Ignore wafw00f banner/version lines.
+        if "wafw00f" in lower:
+            continue
+
+        # Positive detection.
+        if "is behind" in lower:
+            match = re.search(
+                r"is behind\s+(.+?)\s+WAF",
+                line,
+                re.IGNORECASE,
+            )
+
+            if match:
+                return match.group(1).strip(" :.-")
+
+            match = re.search(
+                r"is behind\s+(.+)$",
+                line,
+                re.IGNORECASE,
+            )
+
+            if match:
+                value = match.group(1).strip(" :.-")
+
+                value = re.sub(
+                    r"\s+WAF.*$",
+                    "",
+                    value,
+                    flags=re.IGNORECASE,
+                )
+
+                return value.strip(" :.-")
+
+        # Negative detection.
+        if (
+            "no waf detected" in lower
+            or "does not seem to be behind a waf" in lower
+            or "not behind a waf" in lower
+        ):
+            return "No WAF detected"
+
+    return None
+
+
+async def stage_tech_waf(db: Session, scan: Scan):
+    services = db.scalars(
+        select(WebService).where(
+            WebService.scan_id == scan.id
+        )
+    ).all()
+
+    sem = asyncio.Semaphore(4)
+
+    async def detect(ws: WebService):
+        async with sem:
+            if not ws.url:
+                return ws, None
+
+            res = await run_command(
+                db,
+                scan.id,
+                "wafw00f",
+                "technologies_waf",
+                [ws.url],
+            )
+
+            waf_name = parse_wafw00f_output(
+                res.stdout
+            )
+
+            return ws, waf_name
+
+    results = await asyncio.gather(
+        *(detect(ws) for ws in services)
+    )
+
+    # Perform DB updates sequentially after
+    # all concurrent tool executions finish.
+    for ws, waf_name in results:
+        ws.waf_name = waf_name
+
+    db.commit()
+
+async def stage_nuclei_update(db: Session, scan: Scan):
+    if not settings.nuclei_auto_update:
+        return
+    await run_command(db, scan.id, "nuclei", "nuclei_update", ["-update-templates", "-silent"], timeout=1800)
+
+
+async def stage_nuclei(db: Session, scan: Scan):
+    urls = sorted({
+        w.url
+        for w in db.scalars(
+            select(WebService).where(
+                WebService.scan_id == scan.id
+            )
+        ).all()
+        if w.url
+    })
+
+    urls += sorted({
+        e.url
+        for e in db.scalars(
+            select(Endpoint).where(
+                Endpoint.scan_id == scan.id
+            )
+        ).all()
+        if e.url
+    })
+
+    urls = sorted(set(urls))
+
+    if not urls:
+        return
+
+    with tempfile.NamedTemporaryFile(
+        "w",
+        delete=False
+    ) as tmp:
+        tmp.write(
+            "\n".join(urls) + "\n"
+        )
+        path = tmp.name
+
+    try:
+        res = await run_command(
+            db,
+            scan.id,
+            "nuclei",
+            "nuclei",
+            [
+                "-l", path,
+
+                # New templates from the latest
+                # nuclei-templates release only.
+                "-nt",
+
+                # CVE templates only.
+                "-tags", "cve",
+
+                "-jsonl",
+                "-silent",
+                "-severity",
+                "info,low,medium,high,critical",
+                "-restrict-local-network-access",
+            ],
+        )
+    finally:
+        os.unlink(path)
+
+    # Load all existing dedupe keys once and track new ones in this batch.
+    seen_keys = set(
+        db.scalars(
+            select(Finding.dedupe_key).where(
+                Finding.scan_id == scan.id
+            )
+        ).all()
+    )
+
+    for obj in parse_json_lines(res.stdout):
+        info = obj.get("info") or {}
+
+        name = (
+            info.get("name")
+            or obj.get("template-id")
+            or "Nuclei finding"
+        )
+
+        severity = info.get("severity")
+        target = (
+            obj.get("matched-at")
+            or obj.get("host")
+            or obj.get("url")
+        )
+
+        if not target:
+            continue
+
+        target = str(target).strip()
+
+        key = (
+            f"nuclei|{name}|{target}"
+        )
+
+        # Prevent duplicates already stored in the DB
+        # and duplicates within the same Nuclei batch.
+        if key in seen_keys:
+            continue
+
+        seen_keys.add(key)
+
+        db.add(
+            Finding(
+                scan_id=scan.id,
+                name=str(name)[:255],
+                tool="nuclei",
+                severity=(
+                    str(severity)
+                    if severity
+                    else None
+                ),
+                target=target,
+                dedupe_key=key,
+                status="open",
+                raw=obj,
+            )
+        )
+
+    db.commit()
+
+async def download_js(url: str) -> bytes:
+    response = await asyncio.to_thread(requests.get, url, timeout=30, headers={"User-Agent": "StackSurface/1.0"})
+    response.raise_for_status()
+    return response.content[:5_000_000]
+
+async def stage_js_analysis(db: Session, scan: Scan):
+    js_urls = [
+        e.url
+        for e in db.scalars(
+            select(Endpoint).where(
+                Endpoint.scan_id == scan.id
+            )
+        ).all()
+        if e.url
+        and ".js" in urlparse(e.url).path.lower()
+    ]
+
+    if not js_urls:
+        js_urls = [
+            w.url
+            for w in db.scalars(
+                select(WebService).where(
+                    WebService.scan_id == scan.id
+                )
+            ).all()
+            if w.url
+            and ".js" in urlparse(w.url).path.lower()
+        ]
+
+    js_urls = sorted(set(js_urls))
+
+    if not js_urls:
+        return
+
+    sem = asyncio.Semaphore(4)
+
+    async def analyze(url: str):
+        async with sem:
+            try:
+                content = await download_js(url)
+            except Exception:
+                return [], []
+
+            with tempfile.NamedTemporaryFile(
+                "wb",
+                suffix=".js",
+                delete=False
+            ) as tmp:
+                tmp.write(content)
+                path = tmp.name
+
+            endpoint_candidates = []
+            secret_candidates = []
+
+            try:
+                urls_res = await run_command(
+                    db,
+                    scan.id,
+                    "jsluice",
+                    "js_analysis",
+                    ["urls", path]
+                )
+
+                secrets_res = await run_command(
+                    db,
+                    scan.id,
+                    "jsluice",
+                    "js_analysis",
+                    ["secrets", path]
+                )
+
+                parsed = urlparse(url)
+
+                base = (
+                    f"{parsed.scheme}://"
+                    f"{parsed.netloc}"
+                )
+
+                for obj in parse_json_lines(
+                    urls_res.stdout
+                ):
+                    endpoint = obj.get("url")
+
+                    if not endpoint:
+                        continue
+
+                    endpoint = str(
+                        endpoint
+                    ).strip()
+
+                    if not endpoint:
+                        continue
+
+                    if (
+                        endpoint.startswith("http://")
+                        or endpoint.startswith("https://")
+                    ):
+                        absolute_url = endpoint
+
+                    elif endpoint.startswith("//"):
+                        absolute_url = (
+                            f"{parsed.scheme}:{endpoint}"
+                        )
+
+                    else:
+                        absolute_url = (
+                            f"{base}/"
+                            f"{endpoint.lstrip('/')}"
+                        )
+
+                    endpoint_candidates.append(
+                        (
+                            absolute_url,
+                            obj
+                        )
+                    )
+
+                for obj in parse_json_lines(
+                    secrets_res.stdout
+                ):
+                    kind = (
+                        obj.get("kind")
+                        or "JavaScript secret"
+                    )
+
+                    data = (
+                        obj.get("data")
+                        or {}
+                    )
+
+                    candidate = json.dumps(
+                        data,
+                        sort_keys=True
+                    )
+
+                    secret_candidates.append(
+                        (
+                            kind,
+                            url,
+                            mask_secret(candidate),
+                            obj
+                        )
+                    )
+
+            finally:
+                os.unlink(path)
+
+            return (
+                endpoint_candidates,
+                secret_candidates
+            )
+
+    results = await asyncio.gather(
+        *(
+            analyze(url)
+            for url in js_urls
+        )
+    )
+
+    # Deduplicate endpoints before PostgreSQL INSERT.
+    existing_urls = set(
+        db.scalars(
+            select(Endpoint.url).where(
+                Endpoint.scan_id == scan.id
+            )
+        ).all()
+    )
+
+    seen_urls = set(existing_urls)
+
+    for endpoint_results, _ in results:
+        for endpoint_url, obj in endpoint_results:
+            endpoint_url = endpoint_url.strip()
+
+            if not endpoint_url:
+                continue
+
+            if endpoint_url in seen_urls:
+                continue
+
+            seen_urls.add(endpoint_url)
+
+            endpoint_path = (
+                urlparse(endpoint_url)
+                .path
+                .lower()
+            )
+
+            kind = (
+                "js"
+                if endpoint_path.endswith(".js")
+                else "endpoint"
+            )
+
+            db.add(
+                Endpoint(
+                    scan_id=scan.id,
+                    url=endpoint_url,
+                    source="jsluice",
+                    method=obj.get("method"),
+                    kind=kind,
+                    raw=obj
+                )
+            )
+
+    # Persist Jsluice secrets.
+    for _, secret_results in results:
+        for (
+            kind,
+            location,
+            value_masked,
+            obj
+        ) in secret_results:
+
+            db.add(
+                Secret(
+                    scan_id=scan.id,
+                    source="jsluice",
+                    kind=kind,
+                    location=location,
+                    value_masked=value_masked,
+                    severity=obj.get("severity"),
+                    raw=obj
+                )
+            )
+
+    db.commit()
+
+    # TruffleHog secondary secret analysis.
+    with tempfile.TemporaryDirectory() as temp_dir:
+        paths = []
+
+        for url in js_urls[:100]:
+            try:
+                content = await download_js(url)
+            except Exception:
+                continue
+
+            filename = re.sub(
+                r"[^A-Za-z0-9_.-]",
+                "_",
+                urlparse(
+                    url
+                ).path
+                or "index.js"
+            )[-120:]
+
+            file_path = (
+                Path(temp_dir) / filename
+            )
+
+            file_path.write_bytes(content)
+            paths.append(str(file_path))
+
+        if paths:
+            res = await run_command(
+                db,
+                scan.id,
+                "trufflehog",
+                "js_analysis",
+                [
+                    "filesystem",
+                    temp_dir,
+                    "--json",
+                    "--no-verification"
+                ]
+            )
+
+            for obj in parse_json_lines(
+                res.stdout
+            ):
+                print(
+    "TRUFFLEHOG RAW TYPES:",
+    {
+        k: type(v).__name__
+        for k, v in obj.items()
+    }
+)
+
+                reason = (
+                    obj.get("DetectorName")
+                    or obj.get("detector_name")
+                    or "Potential Secret"
+                )
+
+                raw_value = (
+                    obj.get("Raw")
+                    or obj.get("raw")
+                )
+
+                db.add(
+                    Secret(
+                        scan_id=scan.id,
+                        source="trufflehog",
+                        kind=str(reason),
+                        location=(
+                            obj
+                            .get("SourceMetadata", {})
+                            .get("Data", {})
+                            .get("Filesystem")
+                        ),
+                        value_masked=(
+                            mask_secret(
+                                str(raw_value)
+                            )
+                            if raw_value
+                            else None
+                        ),
+                        verified=obj.get(
+                            "Verified"
+                        ),
+                        raw=obj
+                    )
+                )
+
+            db.commit()
+
+async def stage_changes(db: Session, scan: Scan):
+    previous = previous_completed_scan(db, scan)
+    if not previous:
+        return
+
+    # Clear existing changes so rerunning the stage is deterministic.
+    db.query(Change).filter(Change.scan_id == scan.id).delete(
+        synchronize_session=False
+    )
+    db.flush()
+
+    def snapshot(value):
+        if value is None:
+            return None
+        if isinstance(value, (dict, list, tuple, set)):
+            return json.dumps(value, sort_keys=True, default=str)
+        return str(value)
+
+    def add_change(
+        change_type,
+        asset,
+        previous_value=None,
+        current_value=None,
+    ):
+        db.add(
+            Change(
+                scan_id=scan.id,
+                change_type=change_type,
+                asset=str(asset),
+                previous_value=snapshot(previous_value),
+                current_value=snapshot(current_value),
+            )
+        )
+
+    # ---------------------------------------------------------
+    # SUBDOMAINS
+    # ---------------------------------------------------------
+    old_subs = {
+        x.fqdn: x
+        for x in db.scalars(
+            select(Subdomain).where(Subdomain.scan_id == previous.id)
+        ).all()
+    }
+
+    new_subs = {
+        x.fqdn: x
+        for x in db.scalars(
+            select(Subdomain).where(Subdomain.scan_id == scan.id)
+        ).all()
+    }
+
+    for fqdn in sorted(new_subs.keys() - old_subs.keys()):
+        add_change(
+            "subdomain",
+            fqdn,
+            previous_value=None,
+            current_value="new",
+        )
+        new_subs[fqdn].is_new = True
+
+    for fqdn in sorted(old_subs.keys() - new_subs.keys()):
+        add_change(
+            "subdomain",
+            fqdn,
+            previous_value="present",
+            current_value="removed",
+        )
+
+    # ---------------------------------------------------------
+    # ALIVE WEB SERVICES
+    # ---------------------------------------------------------
+    old_alive = {
+        x.url: x
+        for x in db.scalars(
+            select(WebService).where(WebService.scan_id == previous.id)
+        ).all()
+    }
+
+    new_alive = {
+        x.url: x
+        for x in db.scalars(
+            select(WebService).where(WebService.scan_id == scan.id)
+        ).all()
+    }
+
+    for url in sorted(new_alive.keys() - old_alive.keys()):
+        add_change(
+            "alive",
+            url,
+            previous_value=None,
+            current_value="new",
+        )
+
+    for url in sorted(old_alive.keys() - new_alive.keys()):
+        add_change(
+            "alive",
+            url,
+            previous_value="present",
+            current_value="removed",
+        )
+
+    for url in sorted(old_alive.keys() & new_alive.keys()):
+        old = old_alive[url]
+        new = new_alive[url]
+
+        fields = [
+            "status_code",
+            "title",
+            "ip",
+            "cdn",
+            "cdn_name",
+            "waf_name",
+            "technologies",
+        ]
+
+        for field in fields:
+            old_value = getattr(old, field, None)
+            new_value = getattr(new, field, None)
+
+            if snapshot(old_value) != snapshot(new_value):
+                add_change(
+                    "alive",
+                    url,
+                    previous_value=f"{field}={snapshot(old_value)}",
+                    current_value=f"{field}={snapshot(new_value)}",
+                )
+
+    # ---------------------------------------------------------
+    # ENDPOINTS
+    # ---------------------------------------------------------
+    old_endpoints = {
+        x.url: x
+        for x in db.scalars(
+            select(Endpoint).where(Endpoint.scan_id == previous.id)
+        ).all()
+    }
+
+    new_endpoints = {
+        x.url: x
+        for x in db.scalars(
+            select(Endpoint).where(Endpoint.scan_id == scan.id)
+        ).all()
+    }
+
+    for url in sorted(new_endpoints.keys() - old_endpoints.keys()):
+        add_change(
+            "endpoint",
+            url,
+            previous_value=None,
+            current_value="new",
+        )
+
+    for url in sorted(old_endpoints.keys() - new_endpoints.keys()):
+        add_change(
+            "endpoint",
+            url,
+            previous_value="present",
+            current_value="removed",
+        )
+
+    for url in sorted(old_endpoints.keys() & new_endpoints.keys()):
+        old = old_endpoints[url]
+        new = new_endpoints[url]
+
+        fields = [
+            "status_code",
+            "method",
+            "kind",
+            "source",
+        ]
+
+        for field in fields:
+            old_value = getattr(old, field, None)
+            new_value = getattr(new, field, None)
+
+            if snapshot(old_value) != snapshot(new_value):
+                add_change(
+                    "endpoint",
+                    url,
+                    previous_value=f"{field}={snapshot(old_value)}",
+                    current_value=f"{field}={snapshot(new_value)}",
+                )
+
+    # ---------------------------------------------------------
+    # PORTS
+    # ---------------------------------------------------------
+    def port_key(x):
+        return (x.ip, x.port, x.protocol)
+
+    old_ports = {
+        port_key(x): x
+        for x in db.scalars(
+            select(OpenPort).where(OpenPort.scan_id == previous.id)
+        ).all()
+    }
+
+    new_ports = {
+        port_key(x): x
+        for x in db.scalars(
+            select(OpenPort).where(OpenPort.scan_id == scan.id)
+        ).all()
+    }
+
+    for key in sorted(new_ports.keys() - old_ports.keys()):
+        ip, port, protocol = key
+        add_change(
+            "port",
+            f"{ip}:{port}/{protocol}",
+            previous_value=None,
+            current_value="new",
+        )
+
+    for key in sorted(old_ports.keys() - new_ports.keys()):
+        ip, port, protocol = key
+        add_change(
+            "port",
+            f"{ip}:{port}/{protocol}",
+            previous_value="present",
+            current_value="removed",
+        )
+
+    for key in sorted(old_ports.keys() & new_ports.keys()):
+        old = old_ports[key]
+        new = new_ports[key]
+
+        fields = [
+            "service",
+            "version",
+            "source",
+        ]
+
+        for field in fields:
+            old_value = getattr(old, field, None)
+            new_value = getattr(new, field, None)
+
+            if snapshot(old_value) != snapshot(new_value):
+                ip, port, protocol = key
+
+                add_change(
+                    "port",
+                    f"{ip}:{port}/{protocol}",
+                    previous_value=f"{field}={snapshot(old_value)}",
+                    current_value=f"{field}={snapshot(new_value)}",
+                )
+
+    # ---------------------------------------------------------
+    # INFRASTRUCTURE / IPs
+    # ---------------------------------------------------------
+    old_ips = {
+        x.ip: x
+        for x in db.scalars(
+            select(InfrastructureIP).where(
+                InfrastructureIP.scan_id == previous.id
+            )
+        ).all()
+    }
+
+    new_ips = {
+        x.ip: x
+        for x in db.scalars(
+            select(InfrastructureIP).where(
+                InfrastructureIP.scan_id == scan.id
+            )
+        ).all()
+    }
+
+    for ip in sorted(new_ips.keys() - old_ips.keys()):
+        add_change(
+            "ip",
+            ip,
+            previous_value=None,
+            current_value="new",
+        )
+
+    for ip in sorted(old_ips.keys() - new_ips.keys()):
+        add_change(
+            "ip",
+            ip,
+            previous_value="present",
+            current_value="removed",
+        )
+
+    for ip in sorted(old_ips.keys() & new_ips.keys()):
+        old = old_ips[ip]
+        new = new_ips[ip]
+
+        fields = [
+            "hostnames",
+            "cdn",
+            "cdn_name",
+            "waf_name",
+        ]
+
+        for field in fields:
+            old_value = getattr(old, field, None)
+            new_value = getattr(new, field, None)
+
+            if snapshot(old_value) != snapshot(new_value):
+                add_change(
+                    "ip",
+                    ip,
+                    previous_value=f"{field}={snapshot(old_value)}",
+                    current_value=f"{field}={snapshot(new_value)}",
+                )
+
+    # ---------------------------------------------------------
+    # FINDINGS
+    # ---------------------------------------------------------
+    old_findings = {
+        x.dedupe_key: x
+        for x in db.scalars(
+            select(Finding).where(Finding.scan_id == previous.id)
+        ).all()
+    }
+
+    new_findings = {
+        x.dedupe_key: x
+        for x in db.scalars(
+            select(Finding).where(Finding.scan_id == scan.id)
+        ).all()
+    }
+
+    for key in sorted(new_findings.keys() - old_findings.keys()):
+        finding = new_findings[key]
+
+        add_change(
+            "finding",
+            finding.name,
+            previous_value=None,
+            current_value="new",
+        )
+
+    for key in sorted(old_findings.keys() - new_findings.keys()):
+        finding = old_findings[key]
+
+        add_change(
+            "finding",
+            finding.name,
+            previous_value="present",
+            current_value="removed",
+        )
+
+    for key in sorted(old_findings.keys() & new_findings.keys()):
+        old = old_findings[key]
+        new = new_findings[key]
+
+        fields = [
+            "name",
+            "severity",
+            "target",
+            "status",
+        ]
+
+        for field in fields:
+            old_value = getattr(old, field, None)
+            new_value = getattr(new, field, None)
+
+            if snapshot(old_value) != snapshot(new_value):
+                add_change(
+                    "finding",
+                    new.name,
+                    previous_value=f"{field}={snapshot(old_value)}",
+                    current_value=f"{field}={snapshot(new_value)}",
+                )
+
+    db.commit()
+
+async def run_scan(scan_id: str):
+    db = SessionLocal()
+    scan = db.get(Scan, scan_id)
+    if not scan:
+        db.close()
+        return
+
+    # A duplicate Redis message must never execute a completed/stopped scan again.
+    if scan.status not in {"queued", "running", "stopping"}:
+        db.close()
+        return
+
+    stages = PROFILE_STAGES.get(scan.scan_type, PROFILE_STAGES["full"])
+    if not db.scalars(select(ScanStage).where(ScanStage.scan_id == scan.id)).all():
+        for i, name in enumerate(stages, start=1):
+            db.add(ScanStage(scan_id=scan.id, name=name, position=i))
+        db.commit()
+
+    if scan.cancel_requested:
+        scan.status = "cancelled"
+        scan.finished_at = utcnow()
+        db.commit()
+        db.close()
+        return
+
+    scan.status = "running"
+    scan.started_at = scan.started_at or utcnow()
+    scan.current_stage = None
+    db.commit()
+    warnings = []
+
+    try:
+        for idx, stage_name in enumerate(stages, start=1):
+            if await check_cancel(scan.id):
+                raise ScanCancelled()
+
+            stage = await stage_begin(db, scan, stage_name, idx, len(stages))
+            try:
+                if stage_name == "discovery": await stage_discovery(db, scan)
+                elif stage_name == "alterx": await stage_alterx(db, scan)
+                elif stage_name == "dnsx": await stage_dnsx(db, scan)
+                elif stage_name == "httpx": await stage_httpx(db, scan)
+                elif stage_name == "cdn": await stage_cdn(db, scan)
+                elif stage_name == "shodan": await stage_shodan(db, scan)
+                elif stage_name == "seed_existing": await stage_seed_existing(db, scan)
+                elif stage_name == "web_discovery": await stage_gau_katana(db, scan)
+                elif stage_name == "technologies_waf": await stage_tech_waf(db, scan)
+                elif stage_name == "endpoint_dedupe":
+                    urls = {}
+                    for e in db.scalars(select(Endpoint).where(Endpoint.scan_id == scan.id).order_by(Endpoint.id)).all():
+                        urls.setdefault(e.url, e)
+                    for e in db.scalars(select(Endpoint).where(Endpoint.scan_id == scan.id)).all():
+                        if urls.get(e.url) is not e:
+                            db.delete(e)
+                    db.commit()
+                elif stage_name == "nuclei_update": await stage_nuclei_update(db, scan)
+                elif stage_name == "nuclei": await stage_nuclei(db, scan)
+                elif stage_name == "js_analysis": await stage_js_analysis(db, scan)
+                elif stage_name == "changes": await stage_changes(db, scan)
+                await stage_end(db, scan, stage, True)
+            except ScanCancelled:
+                stage.status = "cancelled"
+                stage.finished_at = utcnow()
+                stage.error = "Scan stopped by user"
+                db.commit()
+                raise
+            except Exception as exc:
+                db.rollback()
+                warnings.append(f"{stage_name}: {exc}")
+                await stage_end(db, scan, stage, False, str(exc))
+
+        scan.status = "completed_with_warnings" if warnings else "completed"
+        scan.progress = 100
+        scan.current_stage = None
+        scan.finished_at = utcnow()
+        scan.error = "\n".join(warnings)[:10000] if warnings else None
+        db.commit()
+    except ScanCancelled:
+        scan.status = "cancelled"
+        scan.progress = min(scan.progress, 99)
+        scan.current_stage = "stopped"
+        scan.error = "Scan stopped by user"
+        scan.finished_at = utcnow()
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        scan.status = "failed"
+        scan.current_stage = None
+        scan.error = str(exc)[:10000]
+        scan.finished_at = utcnow()
+        db.commit()
+    finally:
+        db.close()
+
+
+def recover_stale_jobs() -> None:
+    """Recover jobs after a worker restart without allowing duplicate execution."""
+    db = SessionLocal()
+    try:
+        running = db.scalars(select(Scan).where(Scan.status.in_(["running", "stopping"]))).all()
+        for scan in running:
+            scan.status = "failed"
+            scan.error = "Worker restarted while this scan was running"
+            scan.finished_at = utcnow()
+        # A worker restart terminates child FFUF processes.
+        # Mark any FFUF run left in running/stopping as cancelled.
+        stale_ffuf = db.scalars(
+            select(FFUFRuns).where(
+                FFUFRuns.status.in_(["running", "stopping"])
+            )
+        ).all()
+
+        for run in stale_ffuf:
+            run.status = "cancelled"
+            run.error = "FFUF process ended when worker restarted"
+            run.finished_at = utcnow()
+
+        db.commit()
+
+        queued = db.scalars(select(Scan).where(Scan.status == "queued")).all()
+        for scan in queued:
+            from .queue import enqueue_scan
+            enqueue_scan(scan.id)
+    finally:
+        db.close()
+
+
+async def run_ffuf(run_id: str):
+    db = SessionLocal()
+    run = db.get(FFUFRuns, run_id)
+    if not run:
+        db.close()
+        return
+
+    # Only a queued FFUF job may start a new process.
+    # This prevents duplicate Redis messages from launching the same job twice.
+    if run.status == "stopping":
+        run.status = "cancelled"
+        run.error = "FFUF stopped by user before execution"
+        run.finished_at = utcnow()
+        db.commit()
+        db.close()
+        return
+
+    if run.status != "queued":
+        db.close()
+        return
+
+    run.status = "running"
+    run.started_at = utcnow()
+    db.commit()
+    wordlist_path = None
+
+    try:
+        wordlist = db.get(Wordlist, run.config.get("wordlist_id"))
+        if not wordlist:
+            raise RuntimeError("Wordlist not found")
+
+        with tempfile.NamedTemporaryFile("wb", delete=False) as tmp:
+            tmp.write(wordlist.content)
+            wordlist_path = tmp.name
+
+        args = [
+            "-u", run.url,
+            "-w", wordlist_path,
+            "-json",
+            "-s",
+            "-X", run.config.get("method", "GET"),
+            "-t", str(run.config.get("threads", 20)),
+        ]
+        for header, value in (run.config.get("headers") or {}).items():
+            args += ["-H", f"{header}: {value}"]
+        if run.config.get("body") is not None:
+            args += ["-d", run.config["body"]]
+
+        flag_map = [
+            ("match_status", "-mc"), ("filter_status", "-fc"),
+            ("match_size", "-ms"), ("filter_size", "-fs"),
+            ("match_words", "-mw"), ("filter_words", "-fw"),
+            ("match_lines", "-ml"), ("filter_lines", "-fl"),
+            ("regex", "-fr"), ("extensions", "-e"),
+        ]
+        for key, flag in flag_map:
+            value = run.config.get(key)
+            if value:
+                args += [flag, str(value)]
+        if run.config.get("rate"):
+            args += ["-rate", str(run.config["rate"])]
+        if run.config.get("recursion"):
+            args += ["-recursion"]
+
+        proc = await asyncio.create_subprocess_exec(
+            "ffuf", *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            start_new_session=True,
+        )
+        seq = 0
+        chunks: list[str] = []
+        result_objects: list[dict] = []
+        cancelled = False
+
+        async def read_output():
+            nonlocal seq
+            event_db = SessionLocal()
+            try:
+                while True:
+                    raw = await proc.stdout.readline()
+                    if not raw:
+                        event_db.commit()
+                        return
+                    line = raw.decode(errors="replace").rstrip()
+                    seq += 1
+                    chunks.append(line)
+                    event_db.add(FFUFEvent(ffuf_run_id=run.id, seq=seq, line=line))
+                    try:
+                        obj = json.loads(line)
+                        if isinstance(obj, dict) and ("status" in obj or "url" in obj):
+                            result_objects.append(obj)
+                    except json.JSONDecodeError:
+                        pass
+                    if seq % 5 == 0:
+                        event_db.commit()
+                        db.refresh(run)
+                        run.output = "\n".join(chunks[-500:])
+                        db.commit()
+            finally:
+                event_db.commit()
+                event_db.close()
+
+        async def stop_watch():
+            while proc.returncode is None:
+                check_db = SessionLocal()
+                try:
+                    current = check_db.get(FFUFRuns, run_id)
+                    if current and current.status == "stopping":
+                        return True
+                finally:
+                    check_db.close()
+                await asyncio.sleep(0.5)
+            return False
+
+        output_task = asyncio.create_task(read_output())
+        watch_task = asyncio.create_task(stop_watch())
+        done, _pending = await asyncio.wait(
+            {output_task, watch_task},
+            timeout=settings.ffuf_timeout_seconds,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        if not done:
+            _terminate_process_group(proc, False)
+            await asyncio.sleep(1)
+            if proc.returncode is None:
+                _terminate_process_group(proc, True)
+        elif watch_task in done and watch_task.result():
+            cancelled = True
+            _terminate_process_group(proc, False)
+            await asyncio.sleep(1)
+            if proc.returncode is None:
+                _terminate_process_group(proc, True)
+
+        await proc.wait()
+        await output_task
+        if not watch_task.done():
+            watch_task.cancel()
+
+        run.output = "\n".join(chunks[-2000:])
+        run.exit_code = proc.returncode
+        run.status = "cancelled" if cancelled else ("completed" if proc.returncode == 0 else "failed")
+        run.error = "FFUF stopped by user" if cancelled else None
+        run.finished_at = utcnow()
+
+        # Persist FFUF hits as directory records; PostgreSQL is the durable source of truth.
+        if not cancelled:
+            for obj in result_objects:
+                url = obj.get("url") or obj.get("input")
+                if not url:
+                    continue
+                status = obj.get("status")
+                try:
+                    status = int(status) if status is not None else None
+                except (ValueError, TypeError):
+                    status = None
+                existing = db.scalar(select(Directory).where(Directory.scan_id == run.scan_id, Directory.url == url))
+                if existing:
+                    continue
+                db.add(Directory(
+                    scan_id=run.scan_id,
+                    url=str(url),
+                    status_code=status,
+                    words=int(obj.get("words")) if str(obj.get("words", "")).isdigit() else None,
+                    lines=int(obj.get("lines")) if str(obj.get("lines", "")).isdigit() else None,
+                    size=int(obj.get("length")) if str(obj.get("length", "")).isdigit() else None,
+                    raw=obj,
+                ))
+
+        db.commit()
+    except FileNotFoundError:
+        run.status = "failed"
+        run.error = "ffuf executable is not available in the worker image"
+        run.finished_at = utcnow()
+        db.commit()
+    except Exception as exc:
+        run.status = "failed"
+        run.error = str(exc)
+        run.finished_at = utcnow()
+        db.commit()
+    finally:
+        try:
+            if wordlist_path and os.path.exists(wordlist_path):
+                os.unlink(wordlist_path)
+        except Exception:
+            pass
+        db.close()
+
+
+
+

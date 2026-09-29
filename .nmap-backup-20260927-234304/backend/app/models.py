@@ -69,10 +69,6 @@ class Scan(Base):
     findings: Mapped[list[Finding]] = relationship(back_populates="scan", cascade="all, delete-orphan")
     changes: Mapped[list[Change]] = relationship(back_populates="scan", cascade="all, delete-orphan")
     ffuf_runs: Mapped[list[FFUFRuns]] = relationship(back_populates="scan", cascade="all, delete-orphan")
-    nmap_runs: Mapped[list[NmapRun]] = relationship(
-        back_populates="scan",
-        cascade="all, delete-orphan",
-    )
 
 
 class ScanLink(Base):
@@ -276,82 +272,6 @@ class Wordlist(Base):
     content: Mapped[bytes] = mapped_column(LargeBinary)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
-
-class NmapRun(Base):
-    __tablename__ = "nmap_runs"
-
-    id: Mapped[str] = mapped_column(
-        String(36),
-        primary_key=True,
-        default=lambda: str(uuid4()),
-    )
-
-    scan_id: Mapped[str] = mapped_column(
-        ForeignKey("scans.id", ondelete="CASCADE"),
-        index=True,
-    )
-
-    target: Mapped[str] = mapped_column(Text)
-
-    config: Mapped[dict] = mapped_column(
-        JSONB,
-        default=dict,
-    )
-
-    command: Mapped[str] = mapped_column(
-        Text,
-        default="",
-    )
-
-    status: Mapped[str] = mapped_column(
-        String(30),
-        default="queued",
-        index=True,
-    )
-
-    output: Mapped[str] = mapped_column(
-        Text,
-        default="",
-    )
-
-    xml_output: Mapped[str] = mapped_column(
-        Text,
-        default="",
-    )
-
-    results: Mapped[list] = mapped_column(
-        JSONB,
-        default=list,
-    )
-
-    exit_code: Mapped[int | None] = mapped_column(
-        Integer,
-        nullable=True,
-    )
-
-    error: Mapped[str | None] = mapped_column(
-        Text,
-        nullable=True,
-    )
-
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        default=now,
-    )
-
-    started_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True),
-        nullable=True,
-    )
-
-    finished_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True),
-        nullable=True,
-    )
-
-    scan: Mapped[Scan] = relationship(
-        back_populates="nmap_runs"
-    )
 
 class FFUFRuns(Base):
     __tablename__ = "ffuf_runs"

@@ -62,27 +62,3 @@ class WordlistOut(BaseModel):
     id: str
     name: str
     source: str
-
-class NmapCreate(BaseModel):
-    scan_id: str
-    target: str
-    config: dict = Field(default_factory=dict)
-
-
-class NmapOut(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
-    id: str
-    scan_id: str
-    target: str
-    config: dict
-    command: str
-    status: str
-    output: str
-    results: list
-    exit_code: int | None
-    error: str | None
-    created_at: datetime
-    started_at: datetime | None
-    finished_at: datetime | None
-

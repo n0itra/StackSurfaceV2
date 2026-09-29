@@ -52,8 +52,7 @@ RUN apt-get update && \
         ca-certificates \
         git \
         curl \
-        libgcc-s1 \
-        nmap && \
+        libgcc-s1 && \
     rm -rf /var/lib/apt/lists/*
 
 COPY backend/requirements.txt ./requirements.txt
